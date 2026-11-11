@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// mockSMTP implements smtpClient for  tests.
+// mockSMTP implements smtpClient for tests.
 type mockSMTP struct {
 	mu sync.Mutex
 
