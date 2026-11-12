@@ -1,6 +1,6 @@
 //go:build integration
 
-package integration_test
+package integration_tests
 
 import (
 	"context"
@@ -216,12 +216,10 @@ func extractTextBody(t *testing.T, raw []byte) string {
 		t.Fatalf("parse content type: %v", err)
 	}
 	if !strings.HasPrefix(mediaType, "multipart/") {
-		// Single-part message.
 		return readPart(t, msg.Header.Get("Content-Transfer-Encoding"), msg.Body)
 	}
 
-	// Multipart: iterate parts and return the first text/plain body.
-	mr := multipartReader(t, msg.Body, params["boundary"])
+	mr := multipart.NewReader(msg.Body, params["boundary"])
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -256,13 +254,6 @@ func readPart(t *testing.T, transferEncoding string, r io.Reader) string {
 		t.Fatalf("read body: %v", err)
 	}
 	return string(data)
-}
-
-// multipartReader is a tiny helper to avoid importing mime/multipart
-// at the top level with an alias.
-func multipartReader(t *testing.T, r io.Reader, boundary string) *multipart.Reader {
-	t.Helper()
-	return multipart.NewReader(r, boundary)
 }
 
 func assertBodyContains(t *testing.T, raw []byte, substr string) {
