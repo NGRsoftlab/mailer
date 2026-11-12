@@ -335,7 +335,7 @@ func TestImplicitTLS(t *testing.T) {
 	m, err := mailer.New(mailer.Config{
 		Host:    host,
 		Port:    mustAtoi(portStr),
-		TLSMode: mailer.TLSSSL,
+		TLSMode: mailer.TLSImplicit, // <-- исправлено: TLSImplicit вместо TLSSSL
 		TLSConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
