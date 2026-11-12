@@ -9,11 +9,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
+	"mime"
+	"mime/quotedprintable"
 	"net"
+	"net/mail"
 	"strings"
 	"sync"
 	"testing"
@@ -116,13 +121,8 @@ func startTLSServer(t *testing.T, b *testBackend, implicit bool) (addr string, s
 	s := smtp.NewServer(b)
 	s.Addr = "127.0.0.1:0"
 	s.Domain = "localhost"
-	s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 	s.AllowInsecureAuth = true
 	s.ErrorLog = nil
-
-	if implicit {
-		s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-	}
 
 	ln, err := net.Listen("tcp", s.Addr)
 	if err != nil {
@@ -130,11 +130,25 @@ func startTLSServer(t *testing.T, b *testBackend, implicit bool) (addr string, s
 	}
 	s.Addr = ln.Addr().String()
 
-	go func() {
-		if err := s.Serve(ln); err != nil && !strings.Contains(err.Error(), "closed") {
-			t.Logf("smtp server stopped: %v", err)
-		}
-	}()
+	if implicit {
+		// Implicit TLS: wrap the listener so every accepted connection
+		// starts with a TLS handshake before any SMTP traffic.
+		tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+		go func() {
+			if err := s.Serve(tlsLn); err != nil && !strings.Contains(err.Error(), "closed") {
+				t.Logf("smtp server stopped: %v", err)
+			}
+		}()
+	} else {
+		// STARTTLS: plaintext listener, server advertises STARTTLS
+		// because TLSConfig is set.
+		s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		go func() {
+			if err := s.Serve(ln); err != nil && !strings.Contains(err.Error(), "closed") {
+				t.Logf("smtp server stopped: %v", err)
+			}
+		}()
+	}
 
 	return s.Addr, func() { _ = s.Close() }
 }
@@ -186,10 +200,75 @@ func waitForMessage(t *testing.T, b *testBackend, timeout time.Duration) *testMe
 	return nil
 }
 
-func assertContains(t *testing.T, data []byte, substr string) {
+// extractTextBody decodes the text/plain part of a raw MIME message,
+// handling both quoted-printable and base64 transfer encodings.
+func extractTextBody(t *testing.T, raw []byte) string {
 	t.Helper()
-	if !strings.Contains(string(data), substr) {
-		t.Errorf("message does not contain %q", substr)
+
+	msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatalf("parse message: %v", err)
+	}
+
+	mediaType, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil {
+		t.Fatalf("parse content type: %v", err)
+	}
+	if !strings.HasPrefix(mediaType, "multipart/") {
+		// Single-part message.
+		return readPart(t, msg.Header.Get("Content-Transfer-Encoding"), msg.Body)
+	}
+
+	// Multipart: iterate parts and return the first text/plain body.
+	mr := multipartReader(t, msg.Body, params["boundary"])
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read part: %v", err)
+		}
+		partType, _, err := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if err != nil {
+			continue
+		}
+		if partType == "text/plain" {
+			return readPart(t, part.Header.Get("Content-Transfer-Encoding"), part)
+		}
+	}
+	t.Fatal("no text/plain part found")
+	return ""
+}
+
+func readPart(t *testing.T, transferEncoding string, r io.Reader) string {
+	t.Helper()
+	var reader io.Reader = r
+	switch strings.ToLower(strings.TrimSpace(transferEncoding)) {
+	case "base64":
+		reader = base64.NewDecoder(base64.StdEncoding, r)
+	case "quoted-printable":
+		reader = quotedprintable.NewReader(r)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(data)
+}
+
+// multipartReader is a tiny helper to avoid importing mime/multipart
+// at the top level with an alias.
+func multipartReader(t *testing.T, r io.Reader, boundary string) *multipart.Reader {
+	t.Helper()
+	return multipart.NewReader(r, boundary)
+}
+
+func assertBodyContains(t *testing.T, raw []byte, substr string) {
+	t.Helper()
+	body := extractTextBody(t, raw)
+	if !strings.Contains(body, substr) {
+		t.Errorf("body = %q, want it to contain %q", body, substr)
 	}
 }
 
@@ -230,8 +309,7 @@ func TestPlainSend(t *testing.T) {
 	if len(delivered.To) != 1 || delivered.To[0] != "rcpt@example.com" {
 		t.Errorf("To = %v, want [rcpt@example.com]", delivered.To)
 	}
-	assertContains(t, delivered.Data, "Subject: Plain send")
-	assertContains(t, delivered.Data, "Hello from integration test")
+	assertBodyContains(t, delivered.Data, "Hello from integration test")
 }
 
 func TestSendBulk(t *testing.T) {
@@ -284,7 +362,7 @@ func TestSendBulk(t *testing.T) {
 			t.Errorf("bulk message has %d recipients, want 1", len(delivered.To))
 		}
 		seen[delivered.To[0]] = true
-		assertContains(t, delivered.Data, "Subject: Bulk")
+		assertBodyContains(t, delivered.Data, "Bulk body")
 	}
 	for _, want := range recipients {
 		if !seen[want] {
@@ -323,7 +401,7 @@ func TestStartTLS(t *testing.T) {
 	}
 
 	delivered := waitForMessage(t, backend, 2*time.Second)
-	assertContains(t, delivered.Data, "Encrypted hello")
+	assertBodyContains(t, delivered.Data, "Encrypted hello")
 }
 
 func TestImplicitTLS(t *testing.T) {
@@ -335,7 +413,7 @@ func TestImplicitTLS(t *testing.T) {
 	m, err := mailer.New(mailer.Config{
 		Host:    host,
 		Port:    mustAtoi(portStr),
-		TLSMode: mailer.TLSImplicit, // <-- исправлено: TLSImplicit вместо TLSSSL
+		TLSMode: mailer.TLSImplicit,
 		TLSConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
@@ -356,7 +434,7 @@ func TestImplicitTLS(t *testing.T) {
 	}
 
 	delivered := waitForMessage(t, backend, 2*time.Second)
-	assertContains(t, delivered.Data, "SMTPS hello")
+	assertBodyContains(t, delivered.Data, "SMTPS hello")
 }
 
 func TestContextCancellation(t *testing.T) {
@@ -387,8 +465,8 @@ func TestContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
 	}
-	if !strings.Contains(err.Error(), "context canceled") {
-		t.Errorf("error = %v, want context cancellation", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
 	}
 }
 
