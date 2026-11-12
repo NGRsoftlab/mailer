@@ -1,5 +1,11 @@
 # mailer
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/NGRsoftlab/mailer.svg)](https://pkg.go.dev/github.com/NGRsoftlab/mailer)
+[![CI](https://github.com/NGRsoftlab/mailer/actions/workflows/ci.yml/badge.svg)](https://github.com/NGRsoftlab/mailer/actions/workflows/ci.yml)
+[![Integration](https://github.com/NGRsoftlab/mailer/actions/workflows/integration.yml/badge.svg?branch=main&event=push)](https://github.com/NGRsoftlab/mailer/actions/workflows/integration.yml)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/NGRsoftlab/mailer)](go.mod)
+[![License](https://img.shields.io/github/license/NGRsoftlab/mailer)](LICENSE)
+
 A context-aware SMTP client for Go with connection pooling, parallel bulk sending, flexible TLS, and pluggable authentication.
 
 ## Table of contents
@@ -32,10 +38,10 @@ A context-aware SMTP client for Go with connection pooling, parallel bulk sendin
 ## Installation
 
 ```sh
-go get github.com/example/mailer
+go get github.com/NGRsoftlab/mailer
 ```
 
-Requires Go 1.22 or newer.
+Requires Go 1.26 or newer.
 
 ## Quick start
 
@@ -46,7 +52,7 @@ import (
     "context"
     "log"
 
-    "github.com/example/mailer"
+    "github.com/NGRsoftlab/mailer"
 )
 
 func main() {
