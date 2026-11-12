@@ -41,7 +41,7 @@ A context-aware SMTP client for Go with connection pooling, parallel bulk sendin
 go get github.com/NGRsoftlab/mailer
 ```
 
-Requires Go 1.26 or newer.
+Requires Go 1.26.8 or newer.
 
 ## Quick start
 

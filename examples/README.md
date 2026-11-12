@@ -8,7 +8,7 @@ sync with the public API.
 
 ## Prerequisites
 
-- Go 1.26+
+- Go 1.26.8+
 - An SMTP endpoint (real server, MailHog, GreenMail, etc.)
 
 ## Run
