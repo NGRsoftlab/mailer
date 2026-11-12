@@ -6,7 +6,6 @@ package main
 import (
 	"context"
 	"log"
-	"net/smtp"
 	"os"
 	"strconv"
 	"time"
@@ -31,8 +30,8 @@ func main() {
 
 	switch mech := os.Getenv("AUTH_MECH"); mech {
 	case "", "plain":
-		// PLAIN is provided by the standard library.
-		cfg.Auth = smtp.PlainAuth("", user, pass, host)
+		// PLAIN is provided by the mailer package (alias for smtp.PlainAuth).
+		cfg.Auth = mailer.PlainAuth("", user, pass, host)
 	case "login":
 		// LOGIN is provided by the mailer package.
 		cfg.Auth = mailer.LoginAuth(user, pass)

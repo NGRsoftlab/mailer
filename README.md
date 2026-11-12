@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/NGRsoftlab/mailer.svg)](https://pkg.go.dev/github.com/NGRsoftlab/mailer)
 [![Tests](https://github.com/NGRsoftlab/mailer/actions/workflows/tests.yml/badge.svg)](https://github.com/NGRsoftlab/mailer/actions/workflows/tests.yml)
-![Fuzzing](https://github.com/NGRsoftlab/mailer/actions/workflows/fuzz.yml/badge.svg)
+[![Fuzzing](https://github.com/NGRsoftlab/mailer/actions/workflows/fuzz.yml/badge.svg?branch=main&event=schedule)](https://github.com/NGRsoftlab/mailer/actions/workflows/fuzz.yml)
 [![Integration](https://github.com/NGRsoftlab/mailer/actions/workflows/integration.yml/badge.svg?branch=main&event=push)](https://github.com/NGRsoftlab/mailer/actions/workflows/integration.yml)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/NGRsoftlab/mailer)](go.mod)
 [![License](https://img.shields.io/github/license/NGRsoftlab/mailer)](LICENSE)
@@ -316,8 +316,8 @@ Each `Mailer` owns a pool of SMTP connections. The pool works as follows:
 
 1. On `Send`/`SendBulk`, the mailer asks the pool for a connection.
 2. If the pool has an idle connection, its liveness is verified with `NOOP`.
-  - If `NOOP` succeeds, the connection is reused.
-  - If `NOOP` fails, the connection is closed and the next idle one is tried.
+- If `NOOP` succeeds, the connection is reused.
+- If `NOOP` fails, the connection is closed and the next idle one is tried.
 3. If no live idle connection is available, a new one is dialed.
 4. After a successful send, the connection is returned to the pool (or closed if the pool is at `MaxIdle`).
 5. On any error during send, the connection is discarded — a connection that has seen an error may be in an undefined state.
@@ -406,13 +406,12 @@ Uses a mock `smtpClient`, so no network access is required. Covers:
 ### Integration tests
 
 ```sh
-go test -tags=integration ./...
+go test -tags=integration ./integration_tests/...
 ```
 
 Spins up a real in-process SMTP server (`github.com/emersion/go-smtp`) and exercises real TCP/TLS paths, including:
 
 - plain send,
-- PLAIN auth,
 - STARTTLS,
 - implicit TLS with a self-signed certificate,
 - parallel bulk send,
@@ -422,11 +421,19 @@ The server certificate is generated on the fly, so the test suite is fully self-
 
 ### Fuzz tests
 
+Fuzz targets are gated behind the `fuzz` build tag so they don't slow down the regular test suite. Run the seed corpus with:
+
 ```sh
-go test -fuzz=FuzzMessageBytes -fuzztime=30s .
+go test -tags=fuzz ./fuzzing_tests/...
 ```
 
-`FuzzMessageBytes` feeds arbitrary `from`, `subject`, `text`, `html`, attachment names, and attachment bodies into `Message.Bytes`, then parses the result with `net/mail` and, for multipart messages, with `mime/multipart`. The invariant is: whatever goes in, the output must parse as valid MIME and must not contain injected headers.
+Run an actual fuzzing session for a specific target:
+
+```sh
+go test -tags=fuzz -run=^$ -fuzz=FuzzMessageRender -fuzztime=30s ./fuzzing_tests/
+```
+
+`FuzzMessageRender` feeds arbitrary `from`, `to`, `subject`, `text`, and `html` values into `Message.Bytes`, then parses the result with `net/mail`. Invariants checked: no panic on any input; if `Bytes` returns `nil`, the output must parse as a valid RFC 5322 message; and no header outside the library's own set may appear in the parsed output, which guards against header injection via CR/LF in user-controlled fields.
 
 ## Notes and non-goals
 

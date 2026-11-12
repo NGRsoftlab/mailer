@@ -22,8 +22,10 @@ jobs:
           go-version: '1.26'
           cache: true
 
-      - name: Install test dependency
-        run: go get github.com/emersion/go-smtp@latest
+      # Dependencies are pinned in go.mod; this primes the module cache
+      # without bumping versions behind our back.
+      - name: Download modules
+        run: go mod download
 
       - name: Run integration tests
         run: go test -tags=integration -race -v ./integration_tests/...
