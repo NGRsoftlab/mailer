@@ -1,0 +1,75 @@
+name: fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 3 * * *'   # nightly at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: 'Fuzz duration per target (e.g. 30s, 5m)'
+        required: false
+        default: '60s'
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    name: fuzz seed corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Run seed corpus
+        run: go test -tags=fuzz -race -v ./fuzzing_tests/...
+
+  extended:
+    name: extended fuzzing
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Resolve fuzz time
+        id: fuzztime
+        env:
+          INPUT_FUZZTIME: ${{ github.event.inputs.fuzztime }}
+        run: |
+          value="${INPUT_FUZZTIME:-60s}"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Fuzz each target
+        run: |
+          set -euo pipefail
+          targets=$(go test -tags=fuzz -list '^Fuzz' ./fuzzing_tests/ | grep '^Fuzz' || true)
+          if [ -z "$targets" ]; then
+            echo "no fuzz targets found" >&2
+            exit 1
+          fi
+          for target in $targets; do
+            echo "::group::fuzzing $target"
+            go test -tags=fuzz -run=^$ -fuzz="^${target}\$" \
+              -fuzztime=${{ steps.fuzztime.outputs.value }} ./fuzzing_tests/
+            echo "::endgroup::"
+          done
+
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: fuzzing_tests/testdata/fuzz/
+          if-no-files-found: ignore
