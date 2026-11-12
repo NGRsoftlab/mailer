@@ -1,31 +1,41 @@
 # Examples
 
-Runnable programs that demonstrate the main use cases of
-[`github.com/NGRsoftlab/mailer`](https://pkg.go.dev/github.com/NGRsoftlab/mailer).
+Runnable examples for `github.com/NGRsoftlab/mailer`. Each program is
+self-contained and can be executed with `go run ./examples/<name>`.
 
-All examples live in the library module and are built by CI, so they stay in
-sync with the public API.
+## Configuration
 
-## Prerequisites
+All examples read SMTP settings from environment variables:
 
-- Go 1.26.8+
-- An SMTP endpoint (real server, MailHog, GreenMail, etc.)
+| Variable          | Description                          | Example           |
+|-------------------|--------------------------------------|-------------------|
+| `SMTP_HOST`       | SMTP server hostname                 | smtp.example.com  |
+| `SMTP_PORT`       | SMTP server port                     | 587               |
+| `SMTP_FROM`       | Sender address                       | sender@example.com|
+| `SMTP_USER`       | Auth username (auth example only)    | user@example.com  |
+| `SMTP_PASS`       | Auth password (auth example only)    | secret            |
+| `SMTP_OAUTH_TOKEN`| OAuth2 access token (XOAuth2 only)   | ya29...           |
+| `AUTH_MECH`       | `plain` / `login` / `xoauth2`        | plain             |
+| `TLS_MODE`        | `none` / `starttls` / `implicit`     | starttls          |
 
-## Run
+## Available examples
 
-Each example reads its configuration from environment variables. From the
-repository root:
+- [basic](./basic) — plain-text message
+- [html](./html) — HTML message with plain-text fallback
+- [attachments](./attachments) — multipart/mixed with attachments
+- [auth](./auth) — PLAIN, LOGIN and XOAUTH2 authentication
+- [tls](./tls) — opportunistic STARTTLS, mandatory STARTTLS and implicit TLS
+- [bulk](./bulk) — personalized bulk send with bounded concurrency
 
-    export SMTP_HOST=localhost SMTP_PORT=1025 \
-           SMTP_USER= SMTP_PASS= \
-           SMTP_FROM=from@test.local SMTP_TO=to@test.local
-    go run ./examples/simple
+Run any example:
 
-| Example | What it shows |
-|---|---|
-| [simple](simple) | Plain-text message over STARTTLS |
-| [html_multipart](html_multipart) | `multipart/alternative` with text + HTML |
-| [attachments](attachments) | In-memory attachment via `Attach` |
-| [streaming_attachment](streaming_attachment) | `AttachReader` + `WriteTo` streaming |
-| [mtls](mtls) | Mutual TLS with client certificates |
-| [pool](pool) | Concurrent sends through one client |
+    SMTP_HOST=smtp.example.com \
+    SMTP_PORT=587 \
+    SMTP_FROM=sender@example.com \
+    go run ./examples/basic
+
+## Note on duplication
+
+Examples intentionally duplicate a few lines of setup boilerplate so that
+each file is self-contained and copy-pasteable. For real projects, extract
+shared configuration into your own helper.
