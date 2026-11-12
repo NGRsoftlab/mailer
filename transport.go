@@ -32,21 +32,25 @@ func dialContext(ctx context.Context, cfg dialConfig) (smtpClient, error) {
 	}
 
 	d := &net.Dialer{}
-	var (
-		conn net.Conn
-		err  error
-	)
-	if cfg.mode == TLSImplicit {
-		conn, err = tls.DialWithDialer(d, "tcp", cfg.addr, cfg.tlsConfig)
-	} else {
-		conn, err = d.DialContext(ctx, "tcp", cfg.addr)
-	}
+	conn, err := d.DialContext(ctx, "tcp", cfg.addr)
 	if err != nil {
 		return nil, err
 	}
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
+	}
+
+	if cfg.mode == TLSImplicit {
+		// tls.DialWithDialer dials without a context and blocks the
+		// handshake until the deadline, ignoring context cancellation.
+		// Wrapping a DialContext result with HandshakeContext honors both.
+		tlsConn := tls.Client(conn, cfg.tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("tls handshake: %w", err)
+		}
+		conn = tlsConn
 	}
 
 	client, err := smtp.NewClient(conn, cfg.host)

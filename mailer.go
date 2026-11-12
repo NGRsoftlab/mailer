@@ -1,3 +1,11 @@
+// Package mailer provides a context-aware SMTP client with connection
+// pooling, parallel bulk sending, flexible TLS modes, and pluggable
+// authentication.
+//
+// The entry point is New, which returns a Mailer. Use Send for a
+// single-transaction delivery to all envelope recipients, or SendBulk
+// for personalized parallel delivery. Close must be called to drain
+// the connection pool.
 // Copyright 2020-2026 NGR Softlab
 package mailer
 
@@ -58,6 +66,10 @@ func newWithDial(cfg Config, dial dialFunc) (*Mailer, error) {
 // Send delivers msg to all its envelope recipients (To + Cc + Bcc) in one
 // SMTP transaction.
 func (m *Mailer) Send(ctx context.Context, msg *Message) error {
+	if len(msg.envelopeRecipients()) == 0 {
+		return errors.New("mailer: message has no recipients")
+	}
+
 	return m.send(ctx, msg)
 }
 
@@ -70,6 +82,10 @@ func (m *Mailer) SendBulk(ctx context.Context, msg *Message, recipients []string
 		return nil
 	}
 
+	if msg == nil {
+		return errors.New("mailer: message is nil")
+	}
+
 	concurrency := m.cfg.MaxConcurrency
 	if concurrency < 1 {
 		concurrency = 1
@@ -79,6 +95,11 @@ func (m *Mailer) SendBulk(ctx context.Context, msg *Message, recipients []string
 	var wg sync.WaitGroup
 
 	for i, rcpt := range recipients {
+		if rcpt == "" {
+			errs[i] = errors.New("empty recipient")
+			continue
+		}
+
 		if ctx.Err() != nil {
 			errs[i] = ctx.Err()
 			continue

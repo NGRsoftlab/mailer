@@ -13,6 +13,7 @@ import (
 	"net/textproto"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Attachment describes a single file attached to a message.
@@ -33,6 +34,8 @@ type Message struct {
 	HTML        string
 	Attachments []Attachment
 	Headers     map[string]string
+	Date        time.Time // zero → time.Now()
+	MessageID   string    // empty → generated
 }
 
 // Bytes renders the message as an RFC 5322 MIME document.
@@ -85,16 +88,27 @@ func (m *Message) forRecipient(rcpt string) *Message {
 
 func writeCommonHeaders(buf *bytes.Buffer, m *Message) {
 	fmt.Fprintf(buf, "From: %s\r\n", sanitizeHeaderValue(m.From))
+
 	if len(m.To) > 0 {
 		fmt.Fprintf(buf, "To: %s\r\n", sanitizeAddrList(m.To))
 	}
+
 	if len(m.Cc) > 0 {
 		fmt.Fprintf(buf, "Cc: %s\r\n", sanitizeAddrList(m.Cc))
 	}
+
 	fmt.Fprintf(buf, "Subject: %s\r\n", encodeHeader(m.Subject))
 	fmt.Fprintf(buf, "MIME-Version: 1.0\r\n")
+
+	reserved := map[string]bool{
+		"from": true, "to": true, "cc": true, "bcc": true,
+		"subject": true, "mime-version": true,
+		"content-type": true, "content-transfer-encoding": true,
+	}
+
 	for k, v := range m.Headers {
-		if k == "" || strings.ContainsAny(k, ":\r\n") {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if lk == "" || reserved[lk] || strings.ContainsAny(k, ":\r\n") {
 			continue
 		}
 		fmt.Fprintf(buf, "%s: %s\r\n", k, sanitizeHeaderValue(v))
@@ -231,9 +245,15 @@ func encodeHeader(s string) string {
 }
 
 func sanitizeHeaderValue(s string) string {
-	s = strings.ReplaceAll(s, "\r", "")
-	s = strings.ReplaceAll(s, "\n", "")
-	return s
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r // HTAB is allowed in headers
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func sanitizeAddrList(addrs []string) string {
