@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/NGRsoftlab/mailer.svg)](https://pkg.go.dev/github.com/NGRsoftlab/mailer)
 [![Tests](https://github.com/NGRsoftlab/mailer/actions/workflows/tests.yml/badge.svg)](https://github.com/NGRsoftlab/mailer/actions/workflows/tests.yml)
-[![Fuzzing](https://github.com/NGRsoftlab/mailer/actions/workflows/fuzz.yml/badge.svg)](https://github.com/NGRsoftlab/mailer/actions/workflows/fuzz.yml)
+![Fuzzing](https://github.com/NGRsoftlab/mailer/actions/workflows/fuzz.yml/badge.svg)
 [![Integration](https://github.com/NGRsoftlab/mailer/actions/workflows/integration.yml/badge.svg?branch=main&event=push)](https://github.com/NGRsoftlab/mailer/actions/workflows/integration.yml)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/NGRsoftlab/mailer)](go.mod)
 [![License](https://img.shields.io/github/license/NGRsoftlab/mailer)](LICENSE)
