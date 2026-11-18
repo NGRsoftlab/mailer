@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         # Keep in sync with the minimum version declared in go.mod
-        go: ['1.26.8']
+        go: ['1.26.10']
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,7 @@ jobs:
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: upload coverage
-        if: matrix.go == '1.26.8'
+        if: matrix.go == '1.26.10'
         uses: codecov/codecov-action@v4
         with:
           files: ./coverage.out

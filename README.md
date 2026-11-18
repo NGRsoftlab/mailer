@@ -42,7 +42,7 @@ A context-aware SMTP client for Go with connection pooling, parallel bulk sendin
 go get github.com/NGRsoftlab/mailer
 ```
 
-Requires Go 1.26.8 or newer.
+Requires Go 1.26.10 or newer.
 
 ## Quick start
 
@@ -323,6 +323,8 @@ Each `Mailer` owns a pool of SMTP connections. The pool works as follows:
 5. On any error during send, the connection is discarded — a connection that has seen an error may be in an undefined state.
 
 This gives transparent reconnect behavior: dead connections are detected and replaced without any background goroutines.
+
+`Close` marks the pool as closed and drops every idle connection. It does **not** wait for in-flight `Send` calls to return — that is the caller's responsibility (typically via `defer m.Close()` in `main` and joining any goroutines that call `Send` before returning). Once `Close` has returned, however, `get` will never hand out a connection again: every checkout point (fresh dial, idle reuse, and after the `NOOP` liveness probe) re-checks the closed flag under the pool lock before returning, so a connection that was extracted from the idle list immediately before `Close` is discarded rather than delivered to a caller.
 
 Notes:
 - `MaxIdle` bounds the number of *idle* connections, not the total. Under high concurrency, active connections can exceed `MaxIdle`; they are closed rather than pooled when the send completes.

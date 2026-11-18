@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// errPoolClosed is returned when a get is attempted on a closed pool, or
+// when the pool was closed while a connection was being prepared. Shared
+// as a package-level value so callers can match it with errors.Is.
+var errPoolClosed = errors.New("pool: closed")
+
 // smtpClient is the subset of *smtp.Client used by the mailer. It exists
 // so tests can substitute a mock without a network connection.
 //
@@ -53,11 +58,17 @@ func newConnPool(maxIdle int, dial dialFunc) *connPool {
 // Every branch respects ctx: an already-cancelled context must not be
 // served from the idle list, since that would silently turn a cancelled
 // send into a successful one.
+//
+// Every branch also re-checks p.closed under p.mu immediately before a
+// connection is returned to the caller. Close may run while the pool is
+// probing an idle connection (Noop) or dialing a new one; without the
+// re-check, get would hand out a connection from a closed pool, and a
+// subsequent Write would deliver a message after Close was called.
 func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return nil, errors.New("pool: closed")
+		return nil, errPoolClosed
 	}
 	for len(p.idle) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -79,7 +90,7 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 			p.mu.Lock()
 			if p.closed {
 				p.mu.Unlock()
-				return nil, errors.New("pool: closed")
+				return nil, errPoolClosed
 			}
 			continue
 		}
@@ -94,6 +105,16 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 				_ = c.Close()
 				return nil, err
 			}
+			// Close may have been called while Noop was running. Re-check
+			// under the lock and refuse to hand out a connection from a
+			// closed pool.
+			p.mu.Lock()
+			if p.closed {
+				p.mu.Unlock()
+				_ = c.Close()
+				return nil, errPoolClosed
+			}
+			p.mu.Unlock()
 			return c, nil
 		}
 		_ = c.Close()
@@ -101,7 +122,7 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, errors.New("pool: closed")
+			return nil, errPoolClosed
 		}
 	}
 	p.mu.Unlock()
@@ -114,6 +135,15 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Close may have run while dial was in flight. Same reasoning as for
+	// the Noop branch: never return a connection from a closed pool.
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		_ = raw.Close()
+		return nil, errPoolClosed
+	}
+	p.mu.Unlock()
 	return &poolConn{smtpClient: raw}, nil
 }
 

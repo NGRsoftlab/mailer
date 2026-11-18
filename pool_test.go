@@ -3,6 +3,7 @@ package mailer
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/smtp"
@@ -56,6 +57,19 @@ func (f *fakeClient) Data() (io.WriteCloser, error)     { return nopWriteCloser{
 func (f *fakeClient) SetDeadline(t time.Time) error     { return f.conn.SetDeadline(t) }
 func (f *fakeClient) Close() error                      { return f.conn.Close() }
 
+// callbackClient lets a test run arbitrary code at the beginning of Noop.
+type callbackClient struct {
+	*fakeClient
+	onNoop func()
+}
+
+func (c *callbackClient) Noop() error {
+	if c.onNoop != nil {
+		c.onNoop()
+	}
+	return nil
+}
+
 type nopWriteCloser struct{}
 
 func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
@@ -107,4 +121,61 @@ func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 		)
 	}
 	p.put(c2)
+}
+
+// TestPoolGetAfterClose ensures a closed pool never hands out new
+// connections. Guards the pre-loop check from regressing.
+func TestPoolGetAfterClose(t *testing.T) {
+	p := newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+		return &fakeClient{conn: &fakeConn{}}, nil
+	})
+	p.close()
+
+	_, err := p.get(context.Background())
+	if !errors.Is(err, errPoolClosed) {
+		t.Fatalf("err = %v, want errPoolClosed", err)
+	}
+}
+
+// TestPoolGetHonorsCloseDuringNoop exercises the window between
+// extracting an idle connection and returning it: Close is invoked
+// from inside Noop. get must not return the connection, and it must be
+// closed rather than leaked.
+func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
+	fc := &fakeConn{}
+	var p *connPool
+	c := &callbackClient{
+		fakeClient: &fakeClient{conn: fc},
+		onNoop:     func() { p.close() },
+	}
+	p = newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+		return c, nil
+	})
+
+	// Seed the pool with the callback client so get takes the idle path.
+	p.put(&poolConn{smtpClient: c})
+
+	_, err := p.get(context.Background())
+	if !errors.Is(err, errPoolClosed) {
+		t.Fatalf("err = %v, want errPoolClosed", err)
+	}
+	if !fc.closed {
+		t.Fatal("connection returned from closed pool must be closed")
+	}
+}
+
+// TestPoolGetHonorsCloseDuringDial exercises the window between finishing
+// the dial and returning the fresh connection: Close is invoked from
+// inside dial. get must not return the connection.
+func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
+	var p *connPool
+	p = newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+		p.close()
+		return &fakeClient{conn: &fakeConn{}}, nil
+	})
+
+	_, err := p.get(context.Background())
+	if !errors.Is(err, errPoolClosed) {
+		t.Fatalf("err = %v, want errPoolClosed", err)
+	}
 }
