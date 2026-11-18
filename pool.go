@@ -43,6 +43,10 @@ func newConnPool(maxIdle int, dial dialFunc) *connPool {
 
 // get returns a live connection from the pool or dials a new one.
 // Dead connections are discarded and replaced.
+//
+// Every branch respects ctx: an already-cancelled context must not be
+// served from the idle list, since that would silently turn a cancelled
+// send into a successful one.
 func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 	p.mu.Lock()
 	if p.closed {
@@ -50,11 +54,24 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		return nil, errors.New("pool: closed")
 	}
 	for len(p.idle) > 0 {
+		if err := ctx.Err(); err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
 		c := p.idle[len(p.idle)-1]
 		p.idle = p.idle[:len(p.idle)-1]
 		p.mu.Unlock()
 
 		if err := c.Noop(); err == nil {
+			// Noop is not context-aware, so re-check before handing the
+			// connection back to the caller: it may have taken long enough
+			// for the context to become done. The connection is discarded
+			// because a liveness probe that raced with cancellation leaves
+			// its state unknown.
+			if err := ctx.Err(); err != nil {
+				_ = c.Close()
+				return nil, err
+			}
 			return c, nil
 		}
 		_ = c.Close()
@@ -66,6 +83,10 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		}
 	}
 	p.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	raw, err := p.dial(ctx)
 	if err != nil {

@@ -143,6 +143,12 @@ func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 		ctx, cancel = context.WithTimeout(ctx, m.cfg.Timeout)
 		defer cancel()
 	}
+	// Fail fast on an already-cancelled or already-expired context before
+	// taking or dialing a connection, so a warm pool cannot mask a
+	// cancellation coming from the caller.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	c, err := m.pool.get(ctx)
 	if err != nil {

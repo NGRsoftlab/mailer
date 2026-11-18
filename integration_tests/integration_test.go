@@ -462,6 +462,69 @@ func TestContextCancellation(t *testing.T) {
 	}
 }
 
+// TestContextCancellationWithIdleConn covers the case where the pool
+// already holds a live, idle connection when Send is called with an
+// already-cancelled context. Without an explicit ctx check before
+// handing out the idle connection, such a call would silently succeed
+// and deliver the message. The fix must surface context.Canceled and
+// must not touch the server.
+func TestContextCancellationWithIdleConn(t *testing.T) {
+	backend := &testBackend{}
+	addr, stop := startPlainServer(t, backend)
+	defer stop()
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	m, err := mailer.New(mailer.Config{
+		Host: host,
+		Port: mustAtoi(portStr),
+	})
+	if err != nil {
+		t.Fatalf("mailer.New: %v", err)
+	}
+	defer m.Close()
+
+	// Warm up: send one message so the connection is returned to the
+	// idle pool and available for reuse.
+	warmup := &mailer.Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "warmup",
+		Text:    "warmup",
+	}
+	if err := m.Send(context.Background(), warmup); err != nil {
+		t.Fatalf("warmup Send: %v", err)
+	}
+	_ = waitForMessage(t, backend, 2*time.Second)
+
+	// Now the pool has a live idle connection. Send with a cancelled
+	// context: it must fail without delivering.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = m.Send(ctx, &mailer.Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "cancelled",
+		Text:    "should not be sent",
+	})
+	if err == nil {
+		t.Fatal("expected error from cancelled context with idle conn in pool")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+
+	// Give any (unexpected) delivery a moment to land, then confirm
+	// exactly one message was delivered in total.
+	time.Sleep(100 * time.Millisecond)
+	backend.mu.Lock()
+	n := len(backend.messages)
+	backend.mu.Unlock()
+	if n != 1 {
+		t.Errorf("delivered %d messages, want 1 (cancelled send must not deliver)", n)
+	}
+}
+
 func mustAtoi(s string) int {
 	n := 0
 	for _, r := range s {
