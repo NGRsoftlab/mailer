@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
+	"time"
 )
 
 type TLSMode int
@@ -22,6 +23,20 @@ type dialConfig struct {
 	host      string
 	tlsConfig *tls.Config
 	mode      TLSMode
+}
+
+// smtpConn couples *smtp.Client with the net.Conn underneath it so a
+// per-request deadline can be re-applied on every checkout of a pooled
+// connection. SetDeadline always targets the bottom-most net.Conn, whose
+// deadline governs the socket regardless of any TLS layer wrapped above
+// it (tls.Conn propagates reads/writes and deadlines to its inner conn).
+type smtpConn struct {
+	*smtp.Client
+	conn net.Conn
+}
+
+func (c *smtpConn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
 }
 
 // dialContext establishes an SMTP connection honoring TLS mode, mTLS
@@ -71,5 +86,5 @@ func dialContext(ctx context.Context, cfg dialConfig) (smtpClient, error) {
 		}
 	}
 
-	return client, nil
+	return &smtpConn{Client: client, conn: conn}, nil
 }
