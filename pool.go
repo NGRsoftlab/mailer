@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+// defaultNoopTimeout is the liveness-probe budget applied when the
+// caller does not override it via Config.NoopTimeout. It must be much
+// shorter than a typical Send budget, otherwise a hung peer could tie
+// up an entire send on a dead connection.
+const defaultNoopTimeout = 5 * time.Second
+
 // errPoolClosed is returned when a get is attempted on a closed pool, or
 // when the pool was closed while a connection was being prepared. Shared
 // as a package-level value so callers can match it with errors.Is.
@@ -41,15 +47,19 @@ type poolConn struct {
 type dialFunc func(context.Context) (smtpClient, error)
 
 type connPool struct {
-	mu      sync.Mutex
-	idle    []*poolConn
-	dial    dialFunc
-	maxIdle int
-	closed  bool
+	mu          sync.Mutex
+	idle        []*poolConn
+	dial        dialFunc
+	maxIdle     int
+	noopTimeout time.Duration
+	closed      bool
 }
 
-func newConnPool(maxIdle int, dial dialFunc) *connPool {
-	return &connPool{maxIdle: maxIdle, dial: dial}
+func newConnPool(maxIdle int, noopTimeout time.Duration, dial dialFunc) *connPool {
+	if noopTimeout <= 0 {
+		noopTimeout = defaultNoopTimeout
+	}
+	return &connPool{maxIdle: maxIdle, noopTimeout: noopTimeout, dial: dial}
 }
 
 // get returns a live connection from the pool or dials a new one.
@@ -79,13 +89,17 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		p.idle = p.idle[:len(p.idle)-1]
 		p.mu.Unlock()
 
-		// Refresh the I/O deadline from the current context. A pooled
-		// connection would otherwise keep the deadline applied by a
-		// previous send, which is either already expired (forcing an
-		// unnecessary reconnect) or wrong for the current request.
-		// A zero time means "no deadline" and clears any previous one.
-		deadline, _ := ctx.Deadline()
-		if err := c.SetDeadline(deadline); err != nil {
+		// Compute the probe deadline: the caller's deadline, capped by
+		// noopTimeout. Noop is not context-aware, so without an explicit
+		// cap a slow peer could consume the entire send budget before we
+		// even start the SMTP dialogue. When the caller supplied no
+		// deadline at all, use now+noopTimeout as the sole bound.
+		callerDeadline, hasDeadline := ctx.Deadline()
+		probeDeadline := time.Now().Add(p.noopTimeout)
+		if hasDeadline && callerDeadline.Before(probeDeadline) {
+			probeDeadline = callerDeadline
+		}
+		if err := c.SetDeadline(probeDeadline); err != nil {
 			_ = c.Close()
 			p.mu.Lock()
 			if p.closed {
@@ -115,6 +129,14 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 				return nil, errPoolClosed
 			}
 			p.mu.Unlock()
+			// Restore the caller's deadline so the SMTP dialogue that
+			// follows runs under its own budget, not the short probe one.
+			// A zero callerDeadline (no ctx deadline) clears the socket
+			// deadline, matching the caller's intent.
+			if err := c.SetDeadline(callerDeadline); err != nil {
+				_ = c.Close()
+				return nil, err
+			}
 			return c, nil
 		}
 		_ = c.Close()

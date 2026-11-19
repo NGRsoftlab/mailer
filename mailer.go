@@ -30,6 +30,7 @@ type Config struct {
 	MaxIdle        int         // max pooled connections; default 5
 	MaxConcurrency int         // parallel sends in SendBulk; default 4
 	Timeout        time.Duration
+	NoopTimeout    time.Duration // liveness-probe budget; default 5s
 }
 
 type Mailer struct {
@@ -60,7 +61,7 @@ func newWithDial(cfg Config, dial dialFunc) (*Mailer, error) {
 	if err := normalizeConfig(&cfg); err != nil {
 		return nil, err
 	}
-	return &Mailer{cfg: cfg, pool: newConnPool(cfg.MaxIdle, dial)}, nil
+	return &Mailer{cfg: cfg, pool: newConnPool(cfg.MaxIdle, cfg.NoopTimeout, dial)}, nil
 }
 
 // Send delivers msg to all its envelope recipients (To + Cc + Bcc) in one
@@ -212,6 +213,9 @@ func normalizeConfig(cfg *Config) error {
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
+	}
+	if cfg.NoopTimeout == 0 {
+		cfg.NoopTimeout = defaultNoopTimeout
 	}
 	return nil
 }

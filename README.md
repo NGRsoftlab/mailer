@@ -96,6 +96,7 @@ func main() {
 | `MaxIdle`        | `int`           | `5`     | Maximum number of idle pooled connections.                                  |
 | `MaxConcurrency` | `int`           | `4`     | Maximum parallel deliveries in `SendBulk`.                                  |
 | `Timeout`        | `time.Duration` | `30s`   | Per-send timeout. Applied only if the incoming context has no deadline.     |
+| `NoopTimeout`    | `time.Duration` | `5s`    | Liveness-probe budget per reused connection. Caps the socket deadline during `NOOP`. |
 
 `Config` is validated and normalized inside `New`. Invalid input (empty `Host`) returns an error; zero values of optional fields are replaced with defaults.
 
@@ -315,9 +316,9 @@ If `TLSConfig` is `nil`, a minimal one is created automatically with `ServerName
 Each `Mailer` owns a pool of SMTP connections. The pool works as follows:
 
 1. On `Send`/`SendBulk`, the mailer asks the pool for a connection.
-2. If the pool has an idle connection, its liveness is verified with `NOOP`.
-- If `NOOP` succeeds, the connection is reused.
-- If `NOOP` fails, the connection is closed and the next idle one is tried.
+2. If the pool has an idle connection, its liveness is verified with `NOOP`, bounded by `Config.NoopTimeout` (default `5s`) or the caller's deadline, whichever is shorter.
+- If `NOOP` succeeds, the socket deadline is restored to the caller's deadline and the connection is reused.
+- If `NOOP` fails or times out, the connection is closed and the next idle one is tried.
 3. If no live idle connection is available, a new one is dialed.
 4. After a successful send, the connection is returned to the pool (or closed if the pool is at `MaxIdle`).
 5. On any error during send, the connection is discarded — a connection that has seen an error may be in an undefined state.
@@ -330,6 +331,7 @@ Notes:
 - `MaxIdle` bounds the number of *idle* connections, not the total. Under high concurrency, active connections can exceed `MaxIdle`; they are closed rather than pooled when the send completes.
 - The pool is safe for concurrent use.
 - `Close` on the `Mailer` drains the pool. Call it after all in-flight sends have returned — typically via `defer` in `main`.
+- `NoopTimeout` bounds the liveness probe so a hung peer cannot consume the entire `Send` budget before the SMTP dialogue even starts. Raise it only if you observe spurious evictions of live connections against a high-latency server; lower it if you want faster failure on dead connections.
 
 ## Parallel bulk sending
 

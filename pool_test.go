@@ -70,6 +70,21 @@ func (c *callbackClient) Noop() error {
 	return nil
 }
 
+// peekNoopClient captures the socket deadline in effect at the moment
+// Noop runs, so tests can verify the probe is capped by noopTimeout.
+type peekNoopClient struct {
+	*fakeClient
+	fc     *fakeConn
+	onNoop func(deadline time.Time)
+}
+
+func (c *peekNoopClient) Noop() error {
+	if c.onNoop != nil {
+		c.onNoop(c.fc.deadline)
+	}
+	return nil
+}
+
 type nopWriteCloser struct{}
 
 func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
@@ -83,7 +98,7 @@ func (nopWriteCloser) Close() error                { return nil }
 func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 	var fc *fakeConn
 
-	p := newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		fc = &fakeConn{}
 		// Mimic what dialContext does: apply the caller's deadline on
 		// the freshly created connection.
@@ -126,7 +141,7 @@ func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 // TestPoolGetAfterClose ensures a closed pool never hands out new
 // connections. Guards the pre-loop check from regressing.
 func TestPoolGetAfterClose(t *testing.T) {
-	p := newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return &fakeClient{conn: &fakeConn{}}, nil
 	})
 	p.close()
@@ -148,7 +163,7 @@ func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 		fakeClient: &fakeClient{conn: fc},
 		onNoop:     func() { p.close() },
 	}
-	p = newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+	p = newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return c, nil
 	})
 
@@ -169,7 +184,7 @@ func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 // inside dial. get must not return the connection.
 func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
 	var p *connPool
-	p = newConnPool(1, func(ctx context.Context) (smtpClient, error) {
+	p = newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		p.close()
 		return &fakeClient{conn: &fakeConn{}}, nil
 	})
@@ -177,5 +192,93 @@ func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
 	_, err := p.get(context.Background())
 	if !errors.Is(err, errPoolClosed) {
 		t.Fatalf("err = %v, want errPoolClosed", err)
+	}
+}
+
+// TestPoolNoopDeadlineCappedByNoopTimeout verifies that a Noop on an
+// idle connection is bounded by noopTimeout, not by the caller's full
+// send budget. Without the cap, a hung peer could consume the entire
+// Send budget on a liveness probe. Also verifies the socket deadline is
+// restored to the caller's deadline after the probe succeeds.
+func TestPoolNoopDeadlineCappedByNoopTimeout(t *testing.T) {
+	fc := &fakeConn{}
+	noopTimeout := 100 * time.Millisecond
+
+	var sawDeadline time.Time
+	c := &peekNoopClient{
+		fakeClient: &fakeClient{conn: fc},
+		fc:         fc,
+		onNoop:     func(d time.Time) { sawDeadline = d },
+	}
+	p := newConnPool(1, noopTimeout, func(ctx context.Context) (smtpClient, error) {
+		return c, nil
+	})
+	p.put(&poolConn{smtpClient: c})
+
+	// Caller's deadline is far in the future: 1 hour. If Noop used it,
+	// a hung peer would block for the whole hour.
+	d := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), d)
+	defer cancel()
+
+	got, err := p.get(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	p.put(got)
+
+	if sawDeadline.IsZero() {
+		t.Fatal("Noop saw no deadline; expected now+noopTimeout")
+	}
+	if !sawDeadline.Before(d) {
+		t.Fatalf(
+			"Noop saw deadline %v, want < %v (should be capped by noopTimeout %v)",
+			sawDeadline, d, noopTimeout,
+		)
+	}
+	if sawDeadline.After(time.Now().Add(3 * noopTimeout)) {
+		t.Fatalf("Noop saw deadline %v, want roughly now+%v", sawDeadline, noopTimeout)
+	}
+	// After the probe succeeds, the socket deadline must be restored to
+	// the caller's deadline so the SMTP dialogue runs under its own budget.
+	if !fc.deadline.Equal(d) {
+		t.Fatalf("post-get deadline = %v, want %v", fc.deadline, d)
+	}
+}
+
+// TestPoolNoopBoundedWithoutCtxDeadline verifies that a Noop is bounded
+// by noopTimeout even when the caller supplied a context without any
+// deadline. Without the fix, the probe would block until the peer
+// eventually answered (or forever).
+func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
+	fc := &fakeConn{}
+	noopTimeout := 100 * time.Millisecond
+
+	var sawDeadline time.Time
+	c := &peekNoopClient{
+		fakeClient: &fakeClient{conn: fc},
+		fc:         fc,
+		onNoop:     func(d time.Time) { sawDeadline = d },
+	}
+	p := newConnPool(1, noopTimeout, func(ctx context.Context) (smtpClient, error) {
+		return c, nil
+	})
+	p.put(&poolConn{smtpClient: c})
+
+	got, err := p.get(context.Background())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	p.put(got)
+
+	if sawDeadline.IsZero() {
+		t.Fatal("Noop saw no deadline; expected now+noopTimeout")
+	}
+	if sawDeadline.After(time.Now().Add(3 * noopTimeout)) {
+		t.Fatalf("Noop saw deadline %v, want roughly now+%v", sawDeadline, noopTimeout)
+	}
+	// With no caller deadline, the post-get deadline must be cleared.
+	if !fc.deadline.IsZero() {
+		t.Fatalf("post-get deadline = %v, want zero (no ctx deadline)", fc.deadline)
 	}
 }
