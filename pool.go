@@ -21,6 +21,14 @@ const defaultNoopTimeout = 5 * time.Second
 // as a package-level value so callers can match it with errors.Is.
 var errPoolClosed = errors.New("pool: closed")
 
+// ctxBinder is implemented by connection types that support binding to
+// a context. Plain smtpClient implementations (mocks) do not have to
+// implement it: the pool checks with a type assertion.
+type ctxBinder interface {
+	BindContext(ctx context.Context)
+	ReleaseContext()
+}
+
 // smtpClient is the subset of *smtp.Client used by the mailer. It exists
 // so tests can substitute a mock without a network connection.
 //
@@ -42,6 +50,32 @@ type smtpClient interface {
 type poolConn struct {
 	smtpClient
 	authed bool
+}
+
+// bind associates the connection with ctx so a later cancellation of
+// that ctx closes the socket and unblocks any in-flight Read/Write.
+// No-op for clients that do not implement ctxBinder (test mocks).
+func (pc *poolConn) bind(ctx context.Context) {
+	if b, ok := pc.smtpClient.(ctxBinder); ok {
+		b.BindContext(ctx)
+	}
+}
+
+// release stops any context watcher previously installed via bind.
+// No-op for clients that do not implement ctxBinder.
+func (pc *poolConn) release() {
+	if b, ok := pc.smtpClient.(ctxBinder); ok {
+		b.ReleaseContext()
+	}
+}
+
+// Close releases the context watcher and closes the underlying client.
+// Overriding Close is essential: a watcher left running against a stale
+// (or long-lived) context would leak a goroutine and, worse, kill the
+// socket after the connection had been returned to the pool.
+func (pc *poolConn) Close() error {
+	pc.release()
+	return pc.smtpClient.Close()
 }
 
 type dialFunc func(context.Context) (smtpClient, error)
@@ -137,6 +171,10 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 				_ = c.Close()
 				return nil, err
 			}
+			// Attach the caller's context so a later cancellation tears
+			// the socket down mid-dialogue. Done after all checks so the
+			// watcher never fires on a connection still being validated.
+			c.bind(ctx)
 			return c, nil
 		}
 		_ = c.Close()
@@ -157,22 +195,29 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	pc := &poolConn{smtpClient: raw}
 	// Close may have run while dial was in flight. Same reasoning as for
 	// the Noop branch: never return a connection from a closed pool.
+	// Use poolConn so the context watcher installed by dialContext is
+	// released before the socket is closed.
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		_ = raw.Close()
+		_ = pc.Close()
 		return nil, errPoolClosed
 	}
 	p.mu.Unlock()
-	return &poolConn{smtpClient: raw}, nil
+	return pc, nil
 }
 
 func (p *connPool) put(c *poolConn) {
 	if c == nil {
 		return
 	}
+	// Detach the caller's context before parking the connection. If the
+	// watcher were still bound, a later cancel of that ctx would close
+	// the socket while it sits idle in the pool.
+	c.release()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || len(p.idle) >= p.maxIdle {

@@ -535,3 +535,74 @@ func mustAtoi(s string) int {
 	}
 	return n
 }
+
+// TestContextCancellationDuringDialogue verifies that cancelling the
+// context interrupts an in-flight SMTP exchange — not just the queueing
+// phase. The server below accepts TCP but never sends the 220 greeting,
+// so a client without context cancellation would block on Read until the
+// socket deadline expires (30s by default). With the fix, ctx cancel
+// tears the socket down promptly and Send returns context.Canceled.
+func TestContextCancellationDuringDialogue(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Hold every accepted connection open and silent, so any SMTP
+	// operation blocks in Read.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				<-stop
+				_ = conn.Close()
+			}(c)
+		}
+	}()
+	defer close(stop)
+
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	m, err := mailer.New(mailer.Config{
+		Host: host,
+		Port: mustAtoi(portStr),
+		// Long timeout: if ctx cancel didn't abort, the test would hang
+		// for 30 seconds and fail visibly.
+		Timeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("mailer.New: %v", err)
+	}
+	defer m.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	msg := &mailer.Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "cancelled during dialogue",
+		Text:    "should not be sent",
+	}
+
+	start := time.Now()
+	err = m.Send(ctx, msg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled (translated from socket error)", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Send took %v, want prompt return on ctx cancel", elapsed)
+	}
+}

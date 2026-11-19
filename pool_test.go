@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/smtp"
+	"sync"
 	"testing"
 	"time"
 )
@@ -89,6 +90,28 @@ type nopWriteCloser struct{}
 
 func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
 func (nopWriteCloser) Close() error                { return nil }
+
+// spyCtxClient implements both smtpClient and ctxBinder so the test can
+// verify the pool binds a context on checkout of an idle connection and
+// releases it on put.
+type spyCtxClient struct {
+	*fakeClient
+	mu       sync.Mutex
+	binds    []context.Context
+	releases int
+}
+
+func (s *spyCtxClient) BindContext(ctx context.Context) {
+	s.mu.Lock()
+	s.binds = append(s.binds, ctx)
+	s.mu.Unlock()
+}
+
+func (s *spyCtxClient) ReleaseContext() {
+	s.mu.Lock()
+	s.releases++
+	s.mu.Unlock()
+}
 
 // TestPoolRefreshesDeadlineOnReuse verifies that a pooled connection
 // receives a fresh deadline derived from the current context each time
@@ -280,5 +303,41 @@ func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
 	// With no caller deadline, the post-get deadline must be cleared.
 	if !fc.deadline.IsZero() {
 		t.Fatalf("post-get deadline = %v, want zero (no ctx deadline)", fc.deadline)
+	}
+}
+
+// TestPoolBindsAndReleasesContextOnReuse verifies the checkout lifecycle
+// contract introduced by the context-cancellation fix: an idle
+// connection gets bound to the caller's context on get, and released on
+// put. Without bind on get, a ctx cancelled during the SMTP dialogue
+// would not tear the socket down; without release on put, a cancelled
+// ctx would kill an idle pooled connection.
+func TestPoolBindsAndReleasesContextOnReuse(t *testing.T) {
+	spy := &spyCtxClient{fakeClient: &fakeClient{conn: &fakeConn{}}}
+	p := newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+		return spy, nil
+	})
+	p.put(&poolConn{smtpClient: spy})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, err := p.get(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	spy.mu.Lock()
+	if len(spy.binds) != 1 || spy.binds[0] != ctx {
+		spy.mu.Unlock()
+		t.Fatalf("binds = %v, want exactly [ctx]", spy.binds)
+	}
+	spy.mu.Unlock()
+
+	p.put(c)
+	spy.mu.Lock()
+	releasesAfterPut := spy.releases
+	spy.mu.Unlock()
+	if releasesAfterPut < 1 {
+		t.Fatalf("releases after put = %d, want >= 1", releasesAfterPut)
 	}
 }

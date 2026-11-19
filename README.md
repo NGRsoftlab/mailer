@@ -28,7 +28,7 @@ A context-aware SMTP client for Go with connection pooling, parallel bulk sendin
 
 ## Features
 
-- **Context-aware**: every send honors `context.Context` — timeouts, deadlines and cancellation propagate to the underlying network I/O.
+- **Context-aware**: every send honors `context.Context`. Deadlines become socket deadlines; cancellation tears the underlying TCP socket down, interrupting whichever SMTP operation is currently blocked (greeting read, TLS handshake, AUTH exchange, or DATA write). `Send` returns `context.Canceled` / `context.DeadlineExceeded` — not the raw socket error.
 - **Pluggable authentication**: PLAIN, LOGIN and XOAUTH2 are built in. The public `Auth` type is an alias for `smtp.Auth`, so any custom mechanism compatible with `net/smtp` works without adaptation.
 - **Connection pool**: SMTP connections are reused across sends, checked for liveness via `NOOP` before being handed out, and transparently replaced on failure.
 - **TLS everywhere**: plain SMTP with opportunistic STARTTLS, required STARTTLS, implicit TLS (SMTPS), and mutual TLS (mTLS) via `tls.Config.Certificates`.
@@ -358,6 +358,7 @@ Considerations:
 - raw SMTP errors from `Mail`, `Rcpt`, `Data`, `Write`, `Close`
 
 Use `errors.Is` / `errors.As` to inspect `context.Canceled`, `context.DeadlineExceeded`, and any wrapped `net.Error`.
+If the context is cancelled during the SMTP dialogue, the socket is closed mid-operation and the resulting socket error is translated to the caller's `ctx.Err()` — so `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` work regardless of which operation was in flight.
 
 ### `SendBulk`
 
@@ -447,6 +448,7 @@ go test -tags=fuzz -run=^$ -fuzz=FuzzMessageRender -fuzztime=30s ./fuzzing_tests
 - **No background health checks.** Connection liveness is verified lazily via `NOOP` at the moment a connection is reused. This keeps the pool simple and avoids long-lived goroutines.
 - **`Close` must be called.** The mailer does not leak goroutines on its own, but it holds SMTP connections; `defer m.Close()` is the expected pattern.
 - **Recipients are not validated.** Neither `Send` nor `SendBulk` parses addresses — the SMTP server is the authority. Invalid addresses surface as `Rcpt` errors and are reflected in the returned error.
+- **A single short-lived goroutine per in-flight `Send` bridges `ctx.Done()` to the TCP socket; it is stopped when the connection is returned to the pool, so no long-lived goroutines are created for idle connections.
 
 ## License
 

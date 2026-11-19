@@ -163,6 +163,21 @@ func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 		}
 	}()
 
+	err = m.runDialogue(c, msg)
+	// A cancelled context manifests as "use of closed network connection"
+	// or an i/o timeout from the socket tear-down. Surface the caller's
+	// actual error instead, so errors.Is(err, context.Canceled) and
+	// errors.Is(err, context.DeadlineExceeded) work as expected.
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// runDialogue performs the SMTP transaction on c. Errors are returned
+// verbatim; send translates them to the caller's context error if the
+// context was cancelled during the dialogue.
+func (m *Mailer) runDialogue(c *poolConn, msg *Message) error {
 	if m.cfg.Auth != nil && !c.authed {
 		if ok, _ := c.Extension("AUTH"); ok {
 			if err := c.Auth(m.cfg.Auth); err != nil {
