@@ -3,6 +3,7 @@ package mailer
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"strings"
 	"testing"
@@ -126,5 +127,89 @@ func TestSendBulkCancelledContextNoDial(t *testing.T) {
 		if !errors.Is(e, context.Canceled) {
 			t.Errorf("sub[%d] = %v, want it to wrap context.Canceled", i, e)
 		}
+	}
+}
+
+// TestNewFillsServerNameWhenNil verifies that when the caller passes no
+// TLSConfig, New creates one with ServerName populated from Host. Without
+// it, crypto/tls would silently skip hostname verification.
+func TestNewFillsServerNameWhenNil(t *testing.T) {
+	m, err := newWithDial(Config{Host: "smtp.example.com"}, noDialFunc(t))
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	if m.cfg.TLSConfig == nil {
+		t.Fatal("TLSConfig = nil, want non-nil")
+	}
+	if got := m.cfg.TLSConfig.ServerName; got != "smtp.example.com" {
+		t.Fatalf("ServerName = %q, want smtp.example.com", got)
+	}
+}
+
+// TestNewFillsServerNameWhenEmpty verifies that when the caller passes a
+// TLSConfig without ServerName, New populates it from Host. Otherwise
+// crypto/tls would accept any certificate signed by the supplied roots,
+// regardless of the hostname being dialed.
+func TestNewFillsServerNameWhenEmpty(t *testing.T) {
+	m, err := newWithDial(Config{
+		Host:      "smtp.example.com",
+		TLSConfig: &tls.Config{RootCAs: nil},
+	}, noDialFunc(t))
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	if got := m.cfg.TLSConfig.ServerName; got != "smtp.example.com" {
+		t.Fatalf("ServerName = %q, want smtp.example.com", got)
+	}
+}
+
+// TestNewPreservesExplicitServerName verifies that an explicitly set
+// ServerName is not overwritten. This supports the case where the server
+// certificate is issued for a name other than the dialed host (e.g. an
+// internal alias or IP endpoint behind a load balancer).
+func TestNewPreservesExplicitServerName(t *testing.T) {
+	m, err := newWithDial(Config{
+		Host:      "127.0.0.1",
+		TLSConfig: &tls.Config{ServerName: "smtp.internal.example.com"},
+	}, noDialFunc(t))
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	if got := m.cfg.TLSConfig.ServerName; got != "smtp.internal.example.com" {
+		t.Fatalf("ServerName = %q, want smtp.internal.example.com", got)
+	}
+}
+
+// TestNewClonesTLSConfig verifies that mutating the caller's TLSConfig
+// after New does not affect the Mailer. Without the clone, a caller's
+// later assignment to ServerName (or InsecureSkipVerify) would silently
+// change the mailer's security posture.
+func TestNewClonesTLSConfig(t *testing.T) {
+	original := &tls.Config{ServerName: "smtp.example.com"}
+	m, err := newWithDial(Config{Host: "smtp.example.com", TLSConfig: original}, noDialFunc(t))
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	if m.cfg.TLSConfig == original {
+		t.Fatal("Mailer retains caller's *tls.Config pointer; want clone")
+	}
+
+	// Mutate the original. The mailer must not observe the change.
+	original.ServerName = "attacker.example.com"
+	original.InsecureSkipVerify = true
+
+	if got := m.cfg.TLSConfig.ServerName; got != "smtp.example.com" {
+		t.Errorf("ServerName = %q, want smtp.example.com (mutation leaked)", got)
+	}
+	if m.cfg.TLSConfig.InsecureSkipVerify {
+		t.Error("InsecureSkipVerify = true, want false (mutation leaked)")
 	}
 }

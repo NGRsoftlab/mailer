@@ -26,7 +26,7 @@ type Config struct {
 	Port           int
 	Auth           Auth
 	TLSMode        TLSMode
-	TLSConfig      *tls.Config // supply Certificates for mTLS
+	TLSConfig      *tls.Config // supply Certificates for mTLS; cloned by New
 	MaxIdle        int         // max pooled connections; default 5
 	MaxConcurrency int         // parallel sends in SendBulk; default 4
 	Timeout        time.Duration
@@ -254,5 +254,20 @@ func normalizeConfig(cfg *Config) error {
 	if cfg.NoopTimeout == 0 {
 		cfg.NoopTimeout = defaultNoopTimeout
 	}
+	// Clone the caller's TLSConfig to prevent later mutation from
+	// affecting the Mailer, and ensure ServerName is populated: without
+	// it crypto/tls silently skips hostname verification, turning TLS
+	// into a MITM-friendly handshake. An explicitly set ServerName is
+	// preserved (the caller may be targeting a certificate issued for a
+	// different name, e.g. an internal alias).
+	if cfg.TLSConfig == nil {
+		cfg.TLSConfig = &tls.Config{ServerName: cfg.Host}
+	} else {
+		cfg.TLSConfig = cfg.TLSConfig.Clone()
+		if cfg.TLSConfig.ServerName == "" {
+			cfg.TLSConfig.ServerName = cfg.Host
+		}
+	}
+
 	return nil
 }

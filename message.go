@@ -35,8 +35,8 @@ type Message struct {
 	HTML        string
 	Attachments []Attachment
 	Headers     map[string]string
-	Date        time.Time // zero → time.Now()
-	MessageID   string    // empty → generated
+	Date        time.Time // zero → time.Now() at render time
+	MessageID   string    // empty → generated at render time
 }
 
 // Bytes renders the message as an RFC 5322 MIME document. A nil receiver
@@ -88,6 +88,10 @@ func (m *Message) envelopeRecipients() []string {
 
 // forRecipient returns a shallow copy of the message addressed to a single
 // recipient. Cc and Bcc are cleared so personalization does not leak.
+// MessageID is cleared only when it was not set by the caller: an empty
+// MessageID means "let Bytes generate one", which yields a unique ID per
+// personalized copy. A caller-supplied MessageID is preserved verbatim —
+// the caller is responsible for keeping it unique across copies.
 // A nil receiver yields nil; callers are expected to have validated msg.
 func (m *Message) forRecipient(rcpt string) *Message {
 	if m == nil {
@@ -97,6 +101,10 @@ func (m *Message) forRecipient(rcpt string) *Message {
 	clone.To = []string{rcpt}
 	clone.Cc = nil
 	clone.Bcc = nil
+	if m.MessageID == "" {
+		// Already empty — Bytes will generate a fresh one per copy.
+		clone.MessageID = ""
+	}
 	return &clone
 }
 
@@ -112,11 +120,24 @@ func writeCommonHeaders(buf *bytes.Buffer, m *Message) {
 	}
 
 	fmt.Fprintf(buf, "Subject: %s\r\n", encodeHeader(m.Subject))
+
+	// Date: RFC 5322 REQUIRES a Date header. A zero field means "now".
+	date := m.Date
+	if date.IsZero() {
+		date = time.Now()
+	}
+	fmt.Fprintf(buf, "Date: %s\r\n", date.Format(time.RFC1123Z))
+
+	// Message-ID: RFC 5322 RECOMMENDS a Message-ID. Generate one when the
+	// caller left it empty; otherwise wrap/sanitize what they provided.
+	fmt.Fprintf(buf, "Message-ID: %s\r\n", buildMessageID(m))
+
 	fmt.Fprintf(buf, "MIME-Version: 1.0\r\n")
 
 	reserved := map[string]bool{
 		"from": true, "to": true, "cc": true, "bcc": true,
 		"subject": true, "mime-version": true,
+		"date": true, "message-id": true,
 		"content-type": true, "content-transfer-encoding": true,
 	}
 
@@ -127,6 +148,66 @@ func writeCommonHeaders(buf *bytes.Buffer, m *Message) {
 		}
 		fmt.Fprintf(buf, "%s: %s\r\n", k, sanitizeHeaderValue(v))
 	}
+}
+
+// buildMessageID returns a complete "<id@domain>" token, either derived
+// from m.MessageID (sanitized, possibly wrapped) or freshly generated.
+// All user input is filtered to printable ASCII minus characters that
+// would break out of the header value.
+func buildMessageID(m *Message) string {
+	raw := strings.TrimSpace(m.MessageID)
+	raw = strings.Trim(raw, "<>")
+	raw = sanitizeMessageIDToken(raw)
+
+	// A user-provided ID may or may not contain "@". If it does, both
+	// halves must be non-empty; otherwise regenerate.
+	if at := strings.LastIndex(raw, "@"); at >= 0 {
+		if at == 0 || at == len(raw)-1 {
+			raw = ""
+		}
+	}
+
+	if raw == "" {
+		b := make([]byte, 16)
+		_, _ = rand.Read(b)
+		raw = hex.EncodeToString(b)
+	}
+	if !strings.Contains(raw, "@") {
+		raw = raw + "@" + messageIDDomain(m.From)
+	}
+	return "<" + raw + ">"
+}
+
+// messageIDDomain derives a domain for a generated Message-ID from the
+// From address. Falls back to "mailer" when From is empty, lacks an "@",
+// or contains only characters that cannot appear in an addr-spec.
+func messageIDDomain(from string) string {
+	clean := sanitizeMessageIDToken(from)
+	if at := strings.LastIndex(clean, "@"); at >= 0 && at < len(clean)-1 {
+		if d := clean[at+1:]; d != "" {
+			return d
+		}
+	}
+	return "mailer"
+}
+
+// sanitizeMessageIDToken strips everything outside printable ASCII,
+// removing characters that would terminate the header line or change its
+// structure. "@" is preserved so callers can supply a complete addr-spec.
+func sanitizeMessageIDToken(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < 0x21 || r > 0x7e {
+			continue
+		}
+		switch r {
+		case '<', '>', '(', ')', ',', ';', ':', '\\', '"', ' ', '\t':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func writeMultipartMixed(buf *bytes.Buffer, m *Message, hasAlternative bool) error {

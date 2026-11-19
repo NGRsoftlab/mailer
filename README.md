@@ -31,8 +31,8 @@ A context-aware SMTP client for Go with connection pooling, parallel bulk sendin
 - **Context-aware**: every send honors `context.Context`. Deadlines become socket deadlines; cancellation tears the underlying TCP socket down, interrupting whichever SMTP operation is currently blocked (greeting read, TLS handshake, AUTH exchange, or DATA write). `Send` returns `context.Canceled` / `context.DeadlineExceeded` — not the raw socket error.
 - **Pluggable authentication**: PLAIN, LOGIN and XOAUTH2 are built in. The public `Auth` type is an alias for `smtp.Auth`, so any custom mechanism compatible with `net/smtp` works without adaptation.
 - **Connection pool**: SMTP connections are reused across sends, checked for liveness via `NOOP` before being handed out, and transparently replaced on failure.
-- **TLS everywhere**: plain SMTP with opportunistic STARTTLS, required STARTTLS, implicit TLS (SMTPS), and mutual TLS (mTLS) via `tls.Config.Certificates`.
-- **MIME message builder**: plain text, HTML, `multipart/alternative`, `multipart/mixed` with attachments, custom headers, automatic base64 encoding, and header-injection protection.
+- **TLS everywhere**: plain SMTP with opportunistic STARTTLS, required STARTTLS, implicit TLS (SMTPS), and mutual TLS (mTLS) via `tls.Config.Certificates`. The supplied `TLSConfig` is cloned on `New`, and `ServerName` is auto-populated from `Host` when empty so that hostname verification is never silently disabled.
+- **MIME message builder**: plain text, HTML, `multipart/alternative`, `multipart/mixed` with attachments, custom headers, automatic base64 encoding, RFC 5322 `Date` and `Message-ID` headers, and header-injection protection.
 - **Single and bulk send**: `Send` delivers a message to all recipients in a single SMTP transaction. `SendBulk` delivers personalized copies in parallel with a configurable concurrency limit.
 - **No third-party runtime dependencies**: everything is built on the Go standard library. The only external dependency (`emersion/go-smtp`) is used in integration tests behind a build tag.
 
@@ -92,7 +92,7 @@ func main() {
 | `Port`           | `int`           | `587`   | SMTP server port.                                                           |
 | `Auth`           | `mailer.Auth`   | `nil`   | Auth mechanism. If `nil`, `AUTH` is not attempted.                          |
 | `TLSMode`        | `TLSMode`       | `TLSNone` | TLS strategy (see [TLS, SSL and mTLS](#tls-ssl-and-mtls)).                 |
-| `TLSConfig`      | `*tls.Config`   | `nil`   | TLS settings. Supply `Certificates` for mTLS.                               |
+| `TLSConfig`      | `*tls.Config`   | `nil`   | TLS settings. Supply `Certificates` for mTLS. Cloned by `New`; `ServerName` auto-filled from `Host` if empty. |
 | `MaxIdle`        | `int`           | `5`     | Maximum number of idle pooled connections.                                  |
 | `MaxConcurrency` | `int`           | `4`     | Maximum parallel deliveries in `SendBulk`.                                  |
 | `Timeout`        | `time.Duration` | `30s`   | Per-send timeout. Applied only if the incoming context has no deadline.     |
@@ -134,7 +134,8 @@ For each recipient, `SendBulk` produces a copy in which:
 - `To` contains **only** that recipient,
 - `Cc` is cleared,
 - `Bcc` is cleared,
-- all other fields (`From`, `Subject`, `Text`, `HTML`, `Attachments`, `Headers`) are preserved.
+- `MessageID` is reset to empty **unless** the caller set it explicitly — an auto-generated `Message-ID` is unique per copy,
+- all other fields (`From`, `Subject`, `Text`, `HTML`, `Attachments`, `Headers`, `Date`) are preserved.
 
 This guarantees that recipients do not see each other, which is the common requirement for transactional and notification emails. If you need recipients to see each other, use `Send` with the full recipient list.
 
@@ -151,6 +152,16 @@ Deliveries run concurrently, bounded by `Config.MaxConcurrency`. Failures are co
 | `Text` + `HTML`                         | `multipart/alternative`                     |
 | Any of the above + attachments          | `multipart/mixed` wrapping the above         |
 | Neither `Text` nor `HTML`               | empty `text/plain` body (structurally valid) |
+
+The following headers are always emitted, in this order:
+
+- `From`, `To`, `Cc` (from the corresponding `Message` fields),
+- `Subject` (RFC 2047 encoded when non-ASCII),
+- `Date` — from `Message.Date`, or `time.Now()` in `RFC1123Z` form if zero,
+- `Message-ID` — `<id@domain>` built from `Message.MessageID` when provided, or generated. In both cases the final token is filtered to printable ASCII minus characters that would terminate the header line; a caller-supplied ID that is missing `<>` gets them added.
+- `MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`.
+
+The following headers are reserved and cannot be overridden via `Message.Headers`: `From`, `To`, `Cc`, `Bcc`, `Subject`, `MIME-Version`, `Date`, `Message-ID`, `Content-Type`, `Content-Transfer-Encoding`.
 
 ### Text and HTML
 
@@ -169,6 +180,24 @@ When both `Text` and `HTML` are present, the resulting MIME is `multipart/altern
 **Styling**: there is no separate styling API. HTML email styling is just HTML — inline CSS on the `HTML` field works. If you need templating, render the template to a string before setting `HTML` and `Text`.
 
 **Signature**: likewise, there is no dedicated signature field. Append the signature to `Text` and/or `HTML` before setting the message. This keeps the API minimal and avoids forcing a particular signature format on callers.
+
+### Date and Message-ID
+
+Both fields are optional; when zero/empty, `Bytes` fills them in:
+
+```go
+msg := &mailer.Message{
+    From:      "sender@example.com",
+    To:        []string{"rcpt@example.com"},
+    Subject:   "Order confirmed",
+    Text:      "Your order has been confirmed.",
+    Date:      time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC),
+    MessageID: "order-42@example.com",
+}
+```
+
+- `Date` is rendered in `RFC1123Z` (e.g. `Wed, 01 May 2024 12:00:00 +0000`).
+- `MessageID` is wrapped in `<>` if the caller omitted the brackets. Illegal characters (`<>`, CR, LF, whitespace) are stripped; if the result is empty, a fresh ID is generated. Leave `MessageID` empty to let the library generate a unique value per `Bytes` call — this is also what guarantees that `SendBulk` copies get distinct IDs.
 
 ### Attachments
 
@@ -201,7 +230,7 @@ msg.Headers = map[string]string{
 Safety rules enforced by the builder:
 - Header names containing `:` or CR/LF are silently dropped.
 - Header values have CR and LF stripped, preventing header injection.
-- Well-known headers (`From`, `To`, `Cc`, `Subject`, `MIME-Version`) are set from the dedicated `Message` fields and should not be overridden via `Headers`.
+- Reserved headers (`From`, `To`, `Cc`, `Bcc`, `Subject`, `MIME-Version`, `Date`, `Message-ID`, `Content-Type`, `Content-Transfer-Encoding`) are set from the dedicated `Message` fields and cannot be overridden via `Headers`.
 
 ## Authentication
 
@@ -309,7 +338,7 @@ m, _ := mailer.New(mailer.Config{
 })
 ```
 
-If `TLSConfig` is `nil`, a minimal one is created automatically with `ServerName` set to `Config.Host`. Always supply your own config in production — in particular, do not set `InsecureSkipVerify: true` outside of tests.
+If `TLSConfig` is `nil`, a minimal one is created automatically with `ServerName` set to `Config.Host`. If you do supply a `TLSConfig`, `New` clones it and fills `ServerName` from `Host` when it is empty — an empty `ServerName` in Go's `crypto/tls` disables hostname verification entirely, which makes TLS trivially vulnerable to MITM. An explicitly set `ServerName` (e.g. a certificate issued for an internal alias behind a load balancer) is preserved as-is. Always supply your own config in production — in particular, do not set `InsecureSkipVerify: true` outside of tests.
 
 ## Connection pooling
 
@@ -403,6 +432,7 @@ go test ./...
 Uses a mock `smtpClient`, so no network access is required. Covers:
 
 - Header and MIME structure for all message shapes.
+- `Date` and `Message-ID` rendering, including sanitization of caller-supplied `MessageID` (CRLF injection) and uniqueness across renders.
 - Header injection protection.
 - Correct handling of `AUTH` across connection reuse.
 - Pool reconnect logic on dead connections.
@@ -439,7 +469,7 @@ Run an actual fuzzing session for a specific target:
 go test -tags=fuzz -run=^$ -fuzz=FuzzMessageRender -fuzztime=30s ./fuzzing_tests/
 ```
 
-`FuzzMessageRender` feeds arbitrary `from`, `to`, `subject`, `text`, and `html` values into `Message.Bytes`, then parses the result with `net/mail`. Invariants checked: no panic on any input; if `Bytes` returns `nil`, the output must parse as a valid RFC 5322 message; and no header outside the library's own set may appear in the parsed output, which guards against header injection via CR/LF in user-controlled fields.
+`FuzzMessageRender` feeds arbitrary `from`, `to`, `subject`, `text`, and `html` values into `Message.Bytes`, then parses the result with `net/mail`. Invariants checked: no panic on any input; if `Bytes` returns `nil`, the output must parse as a valid RFC 5322 message; and no header outside the library's own set (which now includes `Date` and `Message-ID`) may appear in the parsed output, which guards against header injection via CR/LF in user-controlled fields.
 
 ## Notes and non-goals
 
@@ -451,6 +481,8 @@ go test -tags=fuzz -run=^$ -fuzz=FuzzMessageRender -fuzztime=30s ./fuzzing_tests
 - **Recipients are not validated.** Neither `Send` nor `SendBulk` parses addresses — the SMTP server is the authority. Invalid addresses surface as `Rcpt` errors and are reflected in the returned error.
 - **A single short-lived goroutine per in-flight `Send` bridges `ctx.Done()` to the TCP socket**; it is stopped when the connection is returned to the pool, so no long-lived goroutines are created for idle connections.
 - **Message-level validation is limited to rejecting `nil` and empty recipient lists**; the actual addresses are the SMTP server's responsibility.
+- **Date and Message-ID are computed at render time.** Each `Bytes()` call re-evaluates `Date` (if zero) and `Message-ID` (if empty), which is what makes `SendBulk` copies uniquely identifiable. If you pass explicit values, they are used as-is — you are then responsible for keeping them unique when sending multiple copies.
+
 ## License
 
 MIT.
