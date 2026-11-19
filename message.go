@@ -102,7 +102,6 @@ func (m *Message) forRecipient(rcpt string) *Message {
 	clone.Cc = nil
 	clone.Bcc = nil
 	if m.MessageID == "" {
-		// Already empty — Bytes will generate a fresh one per copy.
 		clone.MessageID = ""
 	}
 	return &clone
@@ -121,15 +120,12 @@ func writeCommonHeaders(buf *bytes.Buffer, m *Message) {
 
 	fmt.Fprintf(buf, "Subject: %s\r\n", encodeHeader(m.Subject))
 
-	// Date: RFC 5322 REQUIRES a Date header. A zero field means "now".
 	date := m.Date
 	if date.IsZero() {
 		date = time.Now()
 	}
 	fmt.Fprintf(buf, "Date: %s\r\n", date.Format(time.RFC1123Z))
 
-	// Message-ID: RFC 5322 RECOMMENDS a Message-ID. Generate one when the
-	// caller left it empty; otherwise wrap/sanitize what they provided.
 	fmt.Fprintf(buf, "Message-ID: %s\r\n", buildMessageID(m))
 
 	fmt.Fprintf(buf, "MIME-Version: 1.0\r\n")
@@ -159,8 +155,6 @@ func buildMessageID(m *Message) string {
 	raw = strings.Trim(raw, "<>")
 	raw = sanitizeMessageIDToken(raw)
 
-	// A user-provided ID may or may not contain "@". If it does, both
-	// halves must be non-empty; otherwise regenerate.
 	if at := strings.LastIndex(raw, "@"); at >= 0 {
 		if at == 0 || at == len(raw)-1 {
 			raw = ""
@@ -211,7 +205,10 @@ func sanitizeMessageIDToken(s string) string {
 }
 
 func writeMultipartMixed(buf *bytes.Buffer, m *Message, hasAlternative bool) error {
-	boundary := generateBoundary()
+	boundary, err := generateBoundary()
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(buf, "Content-Type: multipart/mixed; boundary=%q\r\n\r\n", boundary)
 
 	w := multipart.NewWriter(buf)
@@ -220,7 +217,10 @@ func writeMultipartMixed(buf *bytes.Buffer, m *Message, hasAlternative bool) err
 	}
 
 	if hasAlternative {
-		altBoundary := generateBoundary()
+		altBoundary, err := generateBoundary()
+		if err != nil {
+			return err
+		}
 		h := textproto.MIMEHeader{}
 		h.Set("Content-Type", fmt.Sprintf("multipart/alternative; boundary=%q", altBoundary))
 		part, err := w.CreatePart(h)
@@ -262,7 +262,10 @@ func writeMultipartMixed(buf *bytes.Buffer, m *Message, hasAlternative bool) err
 }
 
 func writeMultipartAlternative(buf *bytes.Buffer, m *Message) error {
-	boundary := generateBoundary()
+	boundary, err := generateBoundary()
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(buf, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", boundary)
 
 	w := multipart.NewWriter(buf)
@@ -299,13 +302,35 @@ func writeAttachment(w *multipart.Writer, a Attachment) error {
 	}
 	h := textproto.MIMEHeader{}
 	h.Set("Content-Type", ct)
-	h.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", encodeHeader(a.Name)))
+	h.Set("Content-Disposition", formatContentDisposition(a.Name))
 	h.Set("Content-Transfer-Encoding", "base64")
 	p, err := w.CreatePart(h)
 	if err != nil {
 		return err
 	}
 	return writeBase64(p, a.Data)
+}
+
+// formatContentDisposition builds a Content-Disposition header value with
+// the attachment filename properly encoded for MIME parameters (RFC 2231).
+// Using mime.FormatMediaType — rather than RFC 2047 encoded-words — is
+// required for non-ASCII filenames to be shown correctly by receivers;
+// many clients reject the encoded-word form inside a MIME parameter.
+//
+// The filename is first run through sanitizeHeaderValue so CR/LF and
+// other control characters cannot break out of the parameter.
+func formatContentDisposition(name string) string {
+	clean := sanitizeHeaderValue(name)
+	if clean == "" {
+		return "attachment"
+	}
+	if v := mime.FormatMediaType("attachment", map[string]string{"filename": clean}); v != "" {
+		return v
+	}
+	// FormatMediaType returns "" for inputs it refuses to serialize. After
+	// sanitizeHeaderValue this should not happen, but a header without
+	// a filename is still valid and delivers the attachment content.
+	return "attachment"
 }
 
 func writeBase64Part(buf *bytes.Buffer, contentType string, data []byte) {
@@ -329,22 +354,37 @@ func writeBase64(w io.Writer, data []byte) error {
 	return nil
 }
 
-func generateBoundary() string {
+// generateBoundary returns a cryptographically random MIME boundary. The
+// error is propagated to the caller: if crypto/rand is unavailable, we
+// must not fall back to a predictable value — a repeated boundary can
+// collide with message content and corrupt the MIME structure.
+func generateBoundary() (string, error) {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return "b-" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("mailer: generate boundary: %w", err)
+	}
+	return "b-" + hex.EncodeToString(b), nil
 }
 
 func encodeHeader(s string) string {
 	return mime.QEncoding.Encode("UTF-8", sanitizeHeaderValue(s))
 }
 
+// sanitizeHeaderValue strips characters that would terminate or alter a
+// header line. Beyond ASCII controls, this also removes Unicode line and
+// paragraph separators (U+2028, U+2029) and NEL (U+0085): some parsers
+// treat them as line breaks, so they are a header-injection vector. HTAB
+// is preserved because RFC 5322 explicitly allows it inside header values.
 func sanitizeHeaderValue(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\t' {
-			return r // HTAB is allowed in headers
+			return r
 		}
 		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		switch r {
+		case 0x85, 0x2028, 0x2029:
 			return -1
 		}
 		return r

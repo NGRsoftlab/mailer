@@ -103,3 +103,82 @@ func TestMessageBytesSanity(t *testing.T) {
 		t.Fatal("Bytes returned empty output for a valid message")
 	}
 }
+
+// FuzzMessageHeadersAndAttachment feeds arbitrary strings into
+// Message.Headers (as a single key/value pair) and Attachment.Name.
+//
+// Invariants:
+//   - No panic for any input.
+//   - If Bytes returns nil error, the output parses as RFC 5322.
+//   - No header outside the library's own set appears in the parsed
+//     top-level headers, except possibly the exact key the fuzzer
+//     supplied (which is how a legitimate custom header manifests).
+//   - The raw bytes contain no "\r\nBcc:" or "\r\nCc:" sequence, which
+//     would mean a header or attachment name escaped sanitization.
+func FuzzMessageHeadersAndAttachment(f *testing.F) {
+	seeds := []struct {
+		hk, hv, an string
+	}{
+		{"Reply-To", "support@example.com", "report.pdf"},
+		{"X-Custom", "value", "файл.pdf"},
+		{"X-Ok", "value with spaces", "data.bin"},
+		{"Injected\r\nBcc", "x", "a.txt"},
+		{"X-Ok", "value\r\nBcc: victim@example.com", "a.txt"},
+		{"X-Ok", "value", "a\r\ntxt.txt"},
+		{"X-Ok", "value", "a\x00.txt"},
+		{"", "value", "a.txt"},
+	}
+	for _, s := range seeds {
+		f.Add(s.hk, s.hv, s.an)
+	}
+
+	f.Fuzz(func(t *testing.T, hk, hv, an string) {
+		msg := &mailer.Message{
+			From:    "sender@example.com",
+			To:      []string{"rcpt@example.com"},
+			Subject: "test",
+			Text:    "body",
+			Headers: map[string]string{hk: hv},
+			Attachments: []mailer.Attachment{
+				{Name: an, Data: []byte("x")},
+			},
+		}
+
+		raw, err := msg.Bytes()
+		if err != nil {
+			return
+		}
+
+		parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("parse: %v\n--- raw ---\n%s", err, raw)
+		}
+
+		allowed := map[string]bool{
+			"from": true, "to": true, "subject": true,
+			"date": true, "message-id": true,
+			"mime-version": true, "content-type": true,
+			"content-transfer-encoding": true,
+		}
+		hkLower := strings.ToLower(strings.TrimSpace(hk))
+		for name := range parsed.Header {
+			lk := strings.ToLower(name)
+			if allowed[lk] {
+				continue
+			}
+			// A non-standard header is acceptable only if it is exactly
+			// the key the fuzzer asked for; anything else means the input
+			// injected a new header name.
+			if lk != hkLower {
+				t.Fatalf("unexpected header %q\n--- raw ---\n%s", name, raw)
+			}
+		}
+
+		if bytes.Contains(raw, []byte("\r\nBcc:")) {
+			t.Fatalf("CRLF+Bcc leaked\n--- raw ---\n%s", raw)
+		}
+		if bytes.Contains(raw, []byte("\r\nCc:")) {
+			t.Fatalf("CRLF+Cc leaked\n--- raw ---\n%s", raw)
+		}
+	})
+}

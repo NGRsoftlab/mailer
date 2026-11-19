@@ -150,3 +150,53 @@ func TestMessageBytesSanitizesMessageID(t *testing.T) {
 		t.Errorf("Message-Id contains CR/LF: %q", mid)
 	}
 }
+
+// TestMessageBytesAttachmentFilenameRFC2231 verifies that a non-ASCII
+// attachment filename is emitted per RFC 2231 (filename*=UTF-8”...),
+// which is the only form modern clients accept inside a MIME parameter.
+// The old code used RFC 2047 encoded-words, which many clients render
+// as literal =?UTF-8?...?= garbage.
+func TestMessageBytesAttachmentFilenameRFC2231(t *testing.T) {
+	msg := &Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "test",
+		Text:    "body",
+		Attachments: []Attachment{
+			{Name: "файл.pdf", Data: []byte("x")},
+		},
+	}
+	raw, err := msg.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	s := string(raw)
+	if !strings.Contains(s, "filename*=utf-8''") && !strings.Contains(s, "filename*=UTF-8''") {
+		t.Errorf("missing RFC 2231 filename* marker\n--- raw ---\n%s", raw)
+	}
+	if strings.Contains(s, "filename=\"=?UTF-8?") || strings.Contains(s, "filename=\"=?utf-8?") {
+		t.Errorf("RFC 2047 encoded-word inside filename parameter\n--- raw ---\n%s", raw)
+	}
+}
+
+// TestMessageBytesAttachmentFilenameInjection verifies that CR/LF in an
+// attachment name cannot inject a new header. The name must be sanitized
+// before it reaches the Content-Disposition parameter.
+func TestMessageBytesAttachmentFilenameInjection(t *testing.T) {
+	msg := &Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "test",
+		Text:    "body",
+		Attachments: []Attachment{
+			{Name: "safe\r\nBcc: victim@example.com.txt", Data: []byte("x")},
+		},
+	}
+	raw, err := msg.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	if bytes.Contains(raw, []byte("\r\nBcc:")) {
+		t.Fatalf("CRLF+Bcc injected into output\n--- raw ---\n%s", raw)
+	}
+}
