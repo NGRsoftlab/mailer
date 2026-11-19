@@ -109,6 +109,10 @@ func (m *Mailer) SendBulk(ctx context.Context, msg *Message, recipients []string
 			continue
 		}
 
+		// select does not prioritise ctx.Done() over sem: when both are
+		// ready it may pick sem and create a worker even though the
+		// context is already cancelled. The worker's own ctx check below
+		// catches that case, so we still avoid touching the network.
 		select {
 		case <-ctx.Done():
 			errs[i] = ctx.Err()
@@ -120,6 +124,15 @@ func (m *Mailer) SendBulk(ctx context.Context, msg *Message, recipients []string
 		go func(i int, rcpt string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// Re-check inside the worker: the context may have been
+			// cancelled after the main-loop check but before this worker
+			// actually ran. Failing here means forRecipient and send are
+			// skipped entirely — the caller sees "send to <rcpt>" with
+			// context.Canceled, but no attempt was made.
+			if err := ctx.Err(); err != nil {
+				errs[i] = fmt.Errorf("send to %s: %w", rcpt, err)
+				return
+			}
 			if err := m.send(ctx, msg.forRecipient(rcpt)); err != nil {
 				errs[i] = fmt.Errorf("send to %s: %w", rcpt, err)
 			}

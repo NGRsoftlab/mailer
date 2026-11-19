@@ -338,7 +338,7 @@ Notes:
 `SendBulk` runs deliveries in parallel with two mechanisms:
 
 - **Semaphore** — bounds the number of in-flight goroutines to `Config.MaxConcurrency`. Defaults to 4. Set it to the value your SMTP provider tolerates (most providers rate-limit aggressively; 4–8 is usually safe).
-- **Context cancellation** — before starting each delivery, `SendBulk` checks `ctx.Err()`. If the context is already canceled, the remaining recipients are immediately marked as failed without attempting a network round-trip. In-flight sends are cancelled via the context deadline propagated to the socket.
+- **Context cancellation** — before starting each delivery, `SendBulk` checks `ctx.Err()` in the dispatch loop *and* again inside the worker before entering the SMTP dialogue. The second check closes the race window between the dispatch check and the worker running, so a context cancelled in that window still fails per recipient with `context.Canceled` without touching the network. In-flight sends are cancelled via the context propagated to the socket.
 
 Ordering is **not** guaranteed — recipients are delivered in a non-deterministic order. If ordering matters, either sort the recipient list at the caller and process the resulting errors in the corresponding order, or call `Send` sequentially.
 
