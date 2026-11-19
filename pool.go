@@ -29,6 +29,13 @@ type ctxBinder interface {
 	ReleaseContext()
 }
 
+// aborter is implemented by connection types that can tear the socket
+// down without an SMTP QUIT. Used to abort a DATA transaction without
+// committing a partial message.
+type aborter interface {
+	Abort()
+}
+
 // smtpClient is the subset of *smtp.Client used by the mailer. It exists
 // so tests can substitute a mock without a network connection.
 //
@@ -67,6 +74,23 @@ func (pc *poolConn) release() {
 	if b, ok := pc.smtpClient.(ctxBinder); ok {
 		b.ReleaseContext()
 	}
+}
+
+// abort discards the connection without sending an SMTP QUIT. This is
+// required when the DATA phase has been entered but not completed: a
+// graceful Close would try to send QUIT, which the peer interprets as
+// more message body and never acknowledges until it sees the terminating
+// ".\r\n" — the read would block. See smtpConn.Abort for details.
+//
+// Falls back to Close for clients that do not implement aborter (test
+// mocks, which never enter a real DATA state).
+func (pc *poolConn) abort() {
+	pc.release()
+	if a, ok := pc.smtpClient.(aborter); ok {
+		a.Abort()
+		return
+	}
+	_ = pc.smtpClient.Close()
 }
 
 // Close releases the context watcher and closes the underlying client.
@@ -123,11 +147,6 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		p.idle = p.idle[:len(p.idle)-1]
 		p.mu.Unlock()
 
-		// Compute the probe deadline: the caller's deadline, capped by
-		// noopTimeout. Noop is not context-aware, so without an explicit
-		// cap a slow peer could consume the entire send budget before we
-		// even start the SMTP dialogue. When the caller supplied no
-		// deadline at all, use now+noopTimeout as the sole bound.
 		callerDeadline, hasDeadline := ctx.Deadline()
 		probeDeadline := time.Now().Add(p.noopTimeout)
 		if hasDeadline && callerDeadline.Before(probeDeadline) {
@@ -144,18 +163,10 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		}
 
 		if err := c.Noop(); err == nil {
-			// Noop is not context-aware, so re-check before handing the
-			// connection back to the caller: it may have taken long enough
-			// for the context to become done. The connection is discarded
-			// because a liveness probe that raced with cancellation leaves
-			// its state unknown.
 			if err := ctx.Err(); err != nil {
 				_ = c.Close()
 				return nil, err
 			}
-			// Close may have been called while Noop was running. Re-check
-			// under the lock and refuse to hand out a connection from a
-			// closed pool.
 			p.mu.Lock()
 			if p.closed {
 				p.mu.Unlock()
@@ -163,17 +174,10 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 				return nil, errPoolClosed
 			}
 			p.mu.Unlock()
-			// Restore the caller's deadline so the SMTP dialogue that
-			// follows runs under its own budget, not the short probe one.
-			// A zero callerDeadline (no ctx deadline) clears the socket
-			// deadline, matching the caller's intent.
 			if err := c.SetDeadline(callerDeadline); err != nil {
 				_ = c.Close()
 				return nil, err
 			}
-			// Attach the caller's context so a later cancellation tears
-			// the socket down mid-dialogue. Done after all checks so the
-			// watcher never fires on a connection still being validated.
 			c.bind(ctx)
 			return c, nil
 		}
@@ -196,10 +200,6 @@ func (p *connPool) get(ctx context.Context) (*poolConn, error) {
 		return nil, err
 	}
 	pc := &poolConn{smtpClient: raw}
-	// Close may have run while dial was in flight. Same reasoning as for
-	// the Noop branch: never return a connection from a closed pool.
-	// Use poolConn so the context watcher installed by dialContext is
-	// released before the socket is closed.
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -214,9 +214,6 @@ func (p *connPool) put(c *poolConn) {
 	if c == nil {
 		return
 	}
-	// Detach the caller's context before parking the connection. If the
-	// watcher were still bound, a later cancel of that ctx would close
-	// the socket while it sits idle in the pool.
 	c.release()
 	p.mu.Lock()
 	defer p.mu.Unlock()

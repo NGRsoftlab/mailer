@@ -390,6 +390,8 @@ Use `errors.Is` / `errors.As` to inspect `context.Canceled`, `context.DeadlineEx
 If the context is cancelled during the SMTP dialogue, the socket is closed mid-operation and the resulting socket error is translated to the caller's `ctx.Err()` — so `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` work regardless of which operation was in flight.
 `Send` rejects a `nil` message with `mailer: message is nil` before touching the pool or the network. `SendBulk` behaves the same way. All methods on `Message` are safe on a nil receiver: `Bytes` returns an error, while the internal `envelopeRecipients` and `forRecipient` helpers return nil, so a nil `*Message` cannot panic the process.
 
+If an error occurs after the SMTP `DATA` command has been issued — for example, while rendering the message body or writing it to the socket — the transaction is **aborted**, not committed: the connection is closed without sending the terminating `.\r\n`, so the server discards the buffered message (RFC 5321 §4.1.1.4). The caller sees the original error, and no partial or empty message is delivered. Closing the connection with a graceful `QUIT` in this state would block until the socket deadline expires, because the peer is still waiting for the end-of-data marker; the library bypasses `QUIT` by closing the raw socket.
+
 ### `SendBulk`
 
 `SendBulk` aggregates per-recipient errors with `errors.Join`, so:

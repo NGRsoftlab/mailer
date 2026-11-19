@@ -5,9 +5,42 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+// spyWriteCloser is a DATA body writer that records whether Close was
+// called. Used to verify that a failing body write does not send the
+// SMTP terminator (which would commit a partial message).
+type spyWriteCloser struct {
+	writeErr    error
+	closeCalled atomic.Bool
+}
+
+func (s *spyWriteCloser) Write(p []byte) (int, error) {
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	return len(p), nil
+}
+
+func (s *spyWriteCloser) Close() error {
+	s.closeCalled.Store(true)
+	return nil
+}
+
+// dataErrorClient is a fakeClient whose Data returns a spyWriteCloser,
+// so tests can inject a failing body write without a real network.
+type dataErrorClient struct {
+	*fakeClient
+	wc *spyWriteCloser
+}
+
+func (c *dataErrorClient) Data() (io.WriteCloser, error) {
+	return c.wc, nil
+}
 
 // noDialFunc is a dial stub that fails the test if invoked. Used to
 // prove that argument validation happens before any network activity.
@@ -211,5 +244,45 @@ func TestNewClonesTLSConfig(t *testing.T) {
 	}
 	if m.cfg.TLSConfig.InsecureSkipVerify {
 		t.Error("InsecureSkipVerify = true, want false (mutation leaked)")
+	}
+}
+
+// TestSendDataWriteErrorDoesNotCommit verifies that when the DATA body
+// write fails, the data writer is NOT closed. Closing it would send the
+// SMTP terminator ".\r\n", committing a partial or empty message while
+// Send returns an error — the worst of both worlds. The connection is
+// aborted instead (via poolConn.abort in runDialogue), so the server
+// discards the buffered data per RFC 5321 §4.1.1.4.
+func TestSendDataWriteErrorDoesNotCommit(t *testing.T) {
+	writeErr := errors.New("simulated write failure")
+	spy := &spyWriteCloser{writeErr: writeErr}
+	client := &dataErrorClient{
+		fakeClient: &fakeClient{conn: &fakeConn{}},
+		wc:         spy,
+	}
+
+	m, err := newWithDial(Config{Host: "example.com"}, func(ctx context.Context) (smtpClient, error) {
+		return client, nil
+	})
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	msg := &Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "test",
+		Text:    "body",
+	}
+	err = m.Send(context.Background(), msg)
+	if err == nil {
+		t.Fatal("expected error from failing Write")
+	}
+	if !errors.Is(err, writeErr) {
+		t.Errorf("err = %v, want it to wrap %v", err, writeErr)
+	}
+	if spy.closeCalled.Load() {
+		t.Fatal("WriteCloser.Close was called on error; that would commit a partial message")
 	}
 }

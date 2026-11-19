@@ -51,7 +51,6 @@ func (w *ctxWatcherImpl) bind(ctx context.Context) {
 		w.stop = nil
 	}
 	if ctx.Done() == nil {
-		// Background / TODO: nothing to watch.
 		return
 	}
 	stop := make(chan struct{})
@@ -84,9 +83,9 @@ func (w *ctxWatcherImpl) release() {
 // tls.Conn). tls.Conn propagates deadlines to its inner net.Conn, so the
 // underlying socket is still the one being governed.
 //
-// BindContext / ReleaseContext are optional from the pool's point of
-// view — the pool discovers them via type assertion so that mocks
-// without context support keep working.
+// BindContext / ReleaseContext / Abort are optional from the pool's
+// point of view — the pool discovers them via type assertion so that
+// mocks without context support keep working.
 type smtpConn struct {
 	*smtp.Client
 	conn    net.Conn
@@ -108,6 +107,19 @@ func (c *smtpConn) BindContext(ctx context.Context) {
 // when the connection is returned to the pool or discarded.
 func (c *smtpConn) ReleaseContext() {
 	c.watcher.release()
+}
+
+// Abort tears the socket down without performing an SMTP QUIT. It is
+// the mechanism mandated by RFC 5321 §4.1.1.4 for aborting a DATA
+// transaction that could not complete: the server sees the connection
+// drop before the terminating ".\r\n" and discards the buffered message.
+//
+// Calling smtp.Client.Close in this situation would send QUIT into the
+// data stream (where it becomes body content) and then block waiting for
+// a 221 response the server will never send until it sees ".".
+func (c *smtpConn) Abort() {
+	c.watcher.release()
+	_ = c.conn.Close()
 }
 
 // dialContext establishes an SMTP connection honoring TLS mode, mTLS

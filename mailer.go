@@ -199,6 +199,14 @@ func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 // runDialogue performs the SMTP transaction on c. Errors are returned
 // verbatim; send translates them to the caller's context error if the
 // context was cancelled during the dialogue.
+//
+// Once c.Data() succeeds, the SMTP session is in DATA mode: any error
+// from this point must abort the transaction without sending the
+// terminating ".\r\n", otherwise the server commits a partial message
+// while the caller sees an error. c.abort() closes the raw socket to
+// force the RFC 5321 §4.1.1.4 abort; smtp.Client.Close would send QUIT
+// into the data stream and then block waiting for a 221 the server will
+// not emit until it sees ".".
 func (m *Mailer) runDialogue(c *poolConn, msg *Message) error {
 	if m.cfg.Auth != nil && !c.authed {
 		if ok, _ := c.Extension("AUTH"); ok {
@@ -225,16 +233,15 @@ func (m *Mailer) runDialogue(c *poolConn, msg *Message) error {
 
 	body, err := msg.Bytes()
 	if err != nil {
-		_ = w.Close()
+		c.abort()
 		return err
 	}
 	if _, err := w.Write(body); err != nil {
-		_ = w.Close()
+		c.abort()
 		return err
 	}
 	return w.Close()
 }
-
 func normalizeConfig(cfg *Config) error {
 	if cfg.Host == "" {
 		return errors.New("mailer: host is required")
