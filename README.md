@@ -359,6 +359,7 @@ Considerations:
 
 Use `errors.Is` / `errors.As` to inspect `context.Canceled`, `context.DeadlineExceeded`, and any wrapped `net.Error`.
 If the context is cancelled during the SMTP dialogue, the socket is closed mid-operation and the resulting socket error is translated to the caller's `ctx.Err()` — so `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` work regardless of which operation was in flight.
+`Send` rejects a `nil` message with `mailer: message is nil` before touching the pool or the network. `SendBulk` behaves the same way. All methods on `Message` are safe on a nil receiver: `Bytes` returns an error, while the internal `envelopeRecipients` and `forRecipient` helpers return nil, so a nil `*Message` cannot panic the process.
 
 ### `SendBulk`
 
@@ -448,8 +449,8 @@ go test -tags=fuzz -run=^$ -fuzz=FuzzMessageRender -fuzztime=30s ./fuzzing_tests
 - **No background health checks.** Connection liveness is verified lazily via `NOOP` at the moment a connection is reused. This keeps the pool simple and avoids long-lived goroutines.
 - **`Close` must be called.** The mailer does not leak goroutines on its own, but it holds SMTP connections; `defer m.Close()` is the expected pattern.
 - **Recipients are not validated.** Neither `Send` nor `SendBulk` parses addresses — the SMTP server is the authority. Invalid addresses surface as `Rcpt` errors and are reflected in the returned error.
-- **A single short-lived goroutine per in-flight `Send` bridges `ctx.Done()` to the TCP socket; it is stopped when the connection is returned to the pool, so no long-lived goroutines are created for idle connections.
-
+- **A single short-lived goroutine per in-flight `Send` bridges `ctx.Done()` to the TCP socket**; it is stopped when the connection is returned to the pool, so no long-lived goroutines are created for idle connections.
+- **Message-level validation is limited to rejecting `nil` and empty recipient lists**; the actual addresses are the SMTP server's responsibility.
 ## License
 
 MIT.

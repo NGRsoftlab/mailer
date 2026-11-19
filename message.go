@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -38,8 +39,13 @@ type Message struct {
 	MessageID   string    // empty → generated
 }
 
-// Bytes renders the message as an RFC 5322 MIME document.
+// Bytes renders the message as an RFC 5322 MIME document. A nil receiver
+// returns an error instead of panicking, so callers can treat Bytes as a
+// total function.
 func (m *Message) Bytes() ([]byte, error) {
+	if m == nil {
+		return nil, errors.New("mailer: message is nil")
+	}
 	var buf bytes.Buffer
 	writeCommonHeaders(&buf, m)
 
@@ -68,7 +74,11 @@ func (m *Message) Bytes() ([]byte, error) {
 }
 
 // envelopeRecipients returns recipients for the SMTP envelope (To + Cc + Bcc).
+// A nil receiver yields nil, so callers can safely check for "no recipients".
 func (m *Message) envelopeRecipients() []string {
+	if m == nil {
+		return nil
+	}
 	r := make([]string, 0, len(m.To)+len(m.Cc)+len(m.Bcc))
 	r = append(r, m.To...)
 	r = append(r, m.Cc...)
@@ -78,7 +88,11 @@ func (m *Message) envelopeRecipients() []string {
 
 // forRecipient returns a shallow copy of the message addressed to a single
 // recipient. Cc and Bcc are cleared so personalization does not leak.
+// A nil receiver yields nil; callers are expected to have validated msg.
 func (m *Message) forRecipient(rcpt string) *Message {
+	if m == nil {
+		return nil
+	}
 	clone := *m
 	clone.To = []string{rcpt}
 	clone.Cc = nil

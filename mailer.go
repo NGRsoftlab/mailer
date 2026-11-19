@@ -67,6 +67,9 @@ func newWithDial(cfg Config, dial dialFunc) (*Mailer, error) {
 // Send delivers msg to all its envelope recipients (To + Cc + Bcc) in one
 // SMTP transaction.
 func (m *Mailer) Send(ctx context.Context, msg *Message) error {
+	if msg == nil {
+		return errors.New("mailer: message is nil")
+	}
 	if len(msg.envelopeRecipients()) == 0 {
 		return errors.New("mailer: message has no recipients")
 	}
@@ -138,6 +141,12 @@ func (m *Mailer) Close() {
 func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 	if m.closed.Load() {
 		return errors.New("mailer: closed")
+	}
+	// Defensive: Send and SendBulk already validate nil, but this method
+	// is the last line of defence. A future internal caller must not be
+	// able to panic the whole process by passing nil.
+	if msg == nil {
+		return errors.New("mailer: message is nil")
 	}
 	if _, ok := ctx.Deadline(); !ok && m.cfg.Timeout > 0 {
 		var cancel context.CancelFunc
