@@ -16,9 +16,16 @@ import (
 // up an entire send on a dead connection.
 const defaultNoopTimeout = 5 * time.Second
 
-// errPoolClosed is returned when a get is attempted on a closed pool, or
-// when the pool was closed while a connection was being prepared. Shared
-// as a package-level value so callers can match it with errors.Is.
+// maxProbeAttempts caps the number of consecutive failed Noop probes
+// per get() call. Without this cap, a pool holding many dead-but-not-
+// closed idle connections (e.g. MaxIdle=1000 against a hung server)
+// would burn the caller's entire Timeout on sequential noopTimeout
+// waits before falling through to a dial. After this many failures we
+// conclude that the idle set is unusable and dial a fresh connection
+// instead of probing the rest.
+const maxProbeAttempts = 3
+
+// errPoolClosed is returned when a get is attempted on a closed pool.
 var errPoolClosed = errors.New("pool: closed")
 
 // ctxBinder is implemented by connection types that support binding to
@@ -38,10 +45,6 @@ type aborter interface {
 
 // smtpClient is the subset of *smtp.Client used by the mailer. It exists
 // so tests can substitute a mock without a network connection.
-//
-// SetDeadline is required so the pool can refresh the socket deadline
-// each time a connection is checked out; otherwise a deadline applied
-// during a previous Send would silently govern the current one.
 type smtpClient interface {
 	Noop() error
 	Auth(smtp.Auth) error
@@ -54,182 +57,343 @@ type smtpClient interface {
 }
 
 // poolConn tracks per-connection state that outlives one send.
+//
+// onClose is invoked exactly once, when the connection is truly torn
+// down. It releases the slot reserved against connPool.maxOpen (if any).
+// sync.Once guards against double-release when Close is called from
+// multiple sites (mailer.send's defer and connPool.put's overflow path).
 type poolConn struct {
 	smtpClient
-	authed bool
+	authed    bool
+	closeOnce sync.Once
+	onClose   func()
 }
 
-// bind associates the connection with ctx so a later cancellation of
-// that ctx closes the socket and unblocks any in-flight Read/Write.
-// No-op for clients that do not implement ctxBinder (test mocks).
 func (pc *poolConn) bind(ctx context.Context) {
 	if b, ok := pc.smtpClient.(ctxBinder); ok {
 		b.BindContext(ctx)
 	}
 }
 
-// release stops any context watcher previously installed via bind.
-// No-op for clients that do not implement ctxBinder.
 func (pc *poolConn) release() {
 	if b, ok := pc.smtpClient.(ctxBinder); ok {
 		b.ReleaseContext()
 	}
 }
 
-// abort discards the connection without sending an SMTP QUIT. This is
-// required when the DATA phase has been entered but not completed: a
-// graceful Close would try to send QUIT, which the peer interprets as
-// more message body and never acknowledges until it sees the terminating
-// ".\r\n" — the read would block. See smtpConn.Abort for details.
-//
-// Falls back to Close for clients that do not implement aborter (test
-// mocks, which never enter a real DATA state).
+// abort discards the connection without sending an SMTP QUIT. See
+// smtpConn.Abort for the RFC 5321 §4.1.1.4 reasoning.
 func (pc *poolConn) abort() {
 	pc.release()
 	if a, ok := pc.smtpClient.(aborter); ok {
 		a.Abort()
-		return
+	} else {
+		_ = pc.smtpClient.Close()
 	}
-	_ = pc.smtpClient.Close()
+	pc.closeOnce.Do(func() {
+		if pc.onClose != nil {
+			pc.onClose()
+		}
+	})
 }
 
-// Close releases the context watcher and closes the underlying client.
-// Overriding Close is essential: a watcher left running against a stale
-// (or long-lived) context would leak a goroutine and, worse, kill the
-// socket after the connection had been returned to the pool.
+// Close releases the context watcher, closes the underlying client, and
+// releases the MaxOpen slot (once).
 func (pc *poolConn) Close() error {
 	pc.release()
-	return pc.smtpClient.Close()
+	err := pc.smtpClient.Close()
+	pc.closeOnce.Do(func() {
+		if pc.onClose != nil {
+			pc.onClose()
+		}
+	})
+	return err
 }
 
 type dialFunc func(context.Context) (smtpClient, error)
+
+// acquireResult enumerates the four outcomes of acquireOpen. The caller
+// uses this to decide between dialing, looping back, or returning an
+// error — no re-probing of p.closed / ctx.Err() / p.idle is needed.
+type acquireResult int
+
+const (
+	// acquireOK: a MaxOpen slot has been reserved. Caller must dial
+	// (or, upon re-check, take an idle connection it found while
+	// waiting — but the slot itself is now owned).
+	acquireOK acquireResult = iota
+
+	// acquireIdle: an idle connection became available while the
+	// caller was blocked. The caller should loop and pick it up; no
+	// slot was reserved.
+	acquireIdle
+
+	// acquireClosed: the pool was closed. Caller must return
+	// errPoolClosed.
+	acquireClosed
+
+	// acquireCtxDone: ctx was cancelled while waiting. Caller must
+	// return ctx.Err().
+	acquireCtxDone
+)
 
 type connPool struct {
 	mu          sync.Mutex
 	idle        []*poolConn
 	dial        dialFunc
 	maxIdle     int
+	maxOpen     int        // 0 = unbounded
+	open        int        // idle + active
+	openCond    *sync.Cond // broadcast when open decreases or idle grows
 	noopTimeout time.Duration
 	closed      bool
 }
 
-func newConnPool(maxIdle int, noopTimeout time.Duration, dial dialFunc) *connPool {
+func newConnPool(maxIdle, maxOpen int, noopTimeout time.Duration, dial dialFunc) *connPool {
 	if noopTimeout <= 0 {
 		noopTimeout = defaultNoopTimeout
 	}
-	return &connPool{maxIdle: maxIdle, noopTimeout: noopTimeout, dial: dial}
+	p := &connPool{
+		maxIdle:     maxIdle,
+		maxOpen:     maxOpen,
+		noopTimeout: noopTimeout,
+		dial:        dial,
+	}
+	p.openCond = sync.NewCond(&p.mu)
+	return p
+}
+
+// acquireOpen reserves one slot against maxOpen. Blocks until either a
+// slot is available, an idle connection appears, ctx is cancelled, or
+// the pool is closed.
+//
+// Waiters are woken by:
+//   - openCond.Broadcast on release (Close / pool.close),
+//   - openCond.Broadcast on put-to-idle (an idle conn is just as good
+//     as a fresh slot for a waiting caller),
+//   - a per-call watchdog goroutine that broadcasts when ctx is done.
+//
+// Called and returns with p.mu released.
+func (p *connPool) acquireOpen(ctx context.Context) acquireResult {
+	if p.maxOpen == 0 {
+		return acquireOK
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return acquireClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return acquireCtxDone
+	}
+	if p.open < p.maxOpen {
+		p.open++
+		return acquireOK
+	}
+	// Wait loop. A watchdog broadcasts on ctx cancellation so we don't
+	// miss the deadline while blocked on Cond.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			p.openCond.Broadcast()
+			p.mu.Unlock()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	for {
+		if p.closed {
+			return acquireClosed
+		}
+		if err := ctx.Err(); err != nil {
+			return acquireCtxDone
+		}
+		if len(p.idle) > 0 {
+			return acquireIdle
+		}
+		if p.open < p.maxOpen {
+			p.open++
+			return acquireOK
+		}
+		p.openCond.Wait()
+	}
 }
 
 // get returns a live connection from the pool or dials a new one.
-// Dead connections are discarded and replaced.
 //
-// Every branch respects ctx: an already-cancelled context must not be
-// served from the idle list, since that would silently turn a cancelled
-// send into a successful one.
-//
-// Every branch also re-checks p.closed under p.mu immediately before a
-// connection is returned to the caller. Close may run while the pool is
-// probing an idle connection (Noop) or dialing a new one; without the
-// re-check, get would hand out a connection from a closed pool, and a
-// subsequent Write would deliver a message after Close was called.
+// The idle fast path is bounded by maxProbeAttempts: after that many
+// consecutive probe failures the pool stops inspecting idle connections
+// and dials fresh, so a large dead-idle set cannot consume the caller's
+// entire Timeout.
 func (p *connPool) get(ctx context.Context) (*poolConn, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errPoolClosed
-	}
-	for len(p.idle) > 0 {
-		if err := ctx.Err(); err != nil {
-			p.mu.Unlock()
-			return nil, err
-		}
-		c := p.idle[len(p.idle)-1]
-		p.idle = p.idle[:len(p.idle)-1]
-		p.mu.Unlock()
-
-		callerDeadline, hasDeadline := ctx.Deadline()
-		probeDeadline := time.Now().Add(p.noopTimeout)
-		if hasDeadline && callerDeadline.Before(probeDeadline) {
-			probeDeadline = callerDeadline
-		}
-		if err := c.SetDeadline(probeDeadline); err != nil {
-			_ = c.Close()
-			p.mu.Lock()
-			if p.closed {
-				p.mu.Unlock()
-				return nil, errPoolClosed
-			}
-			continue
-		}
-
-		if err := c.Noop(); err == nil {
-			if err := ctx.Err(); err != nil {
-				_ = c.Close()
-				return nil, err
-			}
-			p.mu.Lock()
-			if p.closed {
-				p.mu.Unlock()
-				_ = c.Close()
-				return nil, errPoolClosed
-			}
-			p.mu.Unlock()
-			if err := c.SetDeadline(callerDeadline); err != nil {
-				_ = c.Close()
-				return nil, err
-			}
-			c.bind(ctx)
-			return c, nil
-		}
-		_ = c.Close()
-
+	probeFailures := 0
+	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
 			return nil, errPoolClosed
 		}
-	}
-	p.mu.Unlock()
+		if len(p.idle) > 0 && probeFailures < maxProbeAttempts {
+			c := p.idle[len(p.idle)-1]
+			p.idle = p.idle[:len(p.idle)-1]
+			p.mu.Unlock()
 
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	raw, err := p.dial(ctx)
-	if err != nil {
-		return nil, err
-	}
-	pc := &poolConn{smtpClient: raw}
-	p.mu.Lock()
-	if p.closed {
+			if ok := p.probeAndBind(ctx, c); ok {
+				return c, nil
+			}
+			probeFailures++
+			continue
+		}
 		p.mu.Unlock()
-		_ = pc.Close()
-		return nil, errPoolClosed
+
+		switch p.acquireOpen(ctx) {
+		case acquireOK:
+			// Slot acquired; fall through to the post-acquire path.
+		case acquireIdle:
+			// An idle connection appeared while waiting. Loop back and
+			// take it — unless the probe budget is exhausted, in which
+			// case the next iteration acquires a slot and dials.
+			continue
+		case acquireClosed:
+			return nil, errPoolClosed
+		case acquireCtxDone:
+			return nil, ctx.Err()
+		}
+
+		// Slot reserved. Re-check idle — another goroutine may have
+		// returned a connection while we were waiting. Gated by the
+		// probe budget so we don't keep probing dead idles.
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			p.releaseOpen()
+			return nil, errPoolClosed
+		}
+		if len(p.idle) > 0 && probeFailures < maxProbeAttempts {
+			c := p.idle[len(p.idle)-1]
+			p.idle = p.idle[:len(p.idle)-1]
+			p.mu.Unlock()
+			p.releaseOpen()
+
+			if ok := p.probeAndBind(ctx, c); ok {
+				return c, nil
+			}
+			probeFailures++
+			continue
+		}
+		p.mu.Unlock()
+
+		// Dial with the slot held.
+		raw, err := p.dial(ctx)
+		if err != nil {
+			p.releaseOpen()
+			return nil, err
+		}
+
+		pc := &poolConn{
+			smtpClient: raw,
+			onClose:    p.releaseOpen,
+		}
+		// Close may have run while dial was in flight.
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			_ = pc.Close()
+			return nil, errPoolClosed
+		}
+		p.mu.Unlock()
+		return pc, nil
 	}
-	p.mu.Unlock()
-	return pc, nil
 }
 
+// probeAndBind validates an idle connection and binds it to ctx.
+// Returns true when the connection is ready to hand out.
+func (p *connPool) probeAndBind(ctx context.Context, c *poolConn) bool {
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return false
+	}
+	callerDeadline, hasDeadline := ctx.Deadline()
+	probeDeadline := time.Now().Add(p.noopTimeout)
+	if hasDeadline && callerDeadline.Before(probeDeadline) {
+		probeDeadline = callerDeadline
+	}
+	if err := c.SetDeadline(probeDeadline); err != nil {
+		_ = c.Close()
+		return false
+	}
+	if err := c.Noop(); err != nil {
+		_ = c.Close()
+		return false
+	}
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return false
+	}
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		_ = c.Close()
+		return false
+	}
+	if err := c.SetDeadline(callerDeadline); err != nil {
+		_ = c.Close()
+		return false
+	}
+	c.bind(ctx)
+	return true
+}
+
+// releaseOpen decrements the open counter and wakes a waiter. Safe to
+// call from any goroutine; invoked exactly once per connection via
+// poolConn.closeOnce.
+func (p *connPool) releaseOpen() {
+	if p.maxOpen == 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.open > 0 {
+		p.open--
+	}
+	p.openCond.Signal()
+	p.mu.Unlock()
+}
+
+// put returns c to the idle pool, or closes it if the pool is closed or
+// full. Explicit Lock/Unlock in both branches: c.Close() calls
+// releaseOpen, which re-acquires p.mu — holding the lock across Close
+// would deadlock.
 func (p *connPool) put(c *poolConn) {
 	if c == nil {
 		return
 	}
 	c.release()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed || len(p.idle) >= p.maxIdle {
+		p.mu.Unlock()
 		_ = c.Close()
 		return
 	}
 	p.idle = append(p.idle, c)
+	// Wake anyone blocked in acquireOpen: an idle connection is just as
+	// good as a freshly-acquired slot from their perspective.
+	p.openCond.Broadcast()
+	p.mu.Unlock()
 }
 
 func (p *connPool) close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.closed = true
-	for _, c := range p.idle {
+	idle := p.idle
+	p.idle = nil
+	p.openCond.Broadcast()
+	p.mu.Unlock()
+
+	for _, c := range idle {
 		_ = c.Close()
 	}
-	p.idle = nil
 }

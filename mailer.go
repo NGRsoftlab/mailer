@@ -28,9 +28,21 @@ type Config struct {
 	TLSMode        TLSMode
 	TLSConfig      *tls.Config // supply Certificates for mTLS; cloned by New
 	MaxIdle        int         // max pooled connections; default 5
+	MaxOpen        int         // total open connection cap; 0 = unbounded
 	MaxConcurrency int         // parallel sends in SendBulk; default 4
 	Timeout        time.Duration
 	NoopTimeout    time.Duration // liveness-probe budget; default 5s
+
+	// OnDial, if set, is invoked once per dial attempt with the wall-clock
+	// duration and the resulting error (nil on success). It is called
+	// synchronously on the caller's goroutine; keep it cheap.
+	OnDial func(duration time.Duration, err error)
+
+	// OnSend, if set, is invoked once per Send/SendBulk delivery (one copy
+	// per recipient in SendBulk) with the total wall-clock duration and
+	// the resulting error (nil on success). Called synchronously; keep it
+	// cheap.
+	OnSend func(duration time.Duration, err error)
 }
 
 type Mailer struct {
@@ -56,12 +68,30 @@ func New(cfg Config) (*Mailer, error) {
 	return newWithDial(cfg, dial)
 }
 
-// newWithDial is the internal constructor used by tests.
+// newWithDial is the internal constructor used by tests. It is the sole
+// place where Config.OnDial is wired into the pool's dial function:
+// wrapping in New would make every test constructor silently bypass the
+// hook. New() and newWithDial() must produce a Mailer whose hooks fire
+// identically; that contract is what lets unit tests assert on Config
+// behavior without a real socket.
 func newWithDial(cfg Config, dial dialFunc) (*Mailer, error) {
 	if err := normalizeConfig(&cfg); err != nil {
 		return nil, err
 	}
-	return &Mailer{cfg: cfg, pool: newConnPool(cfg.MaxIdle, cfg.NoopTimeout, dial)}, nil
+	if cfg.OnDial != nil {
+		inner := dial
+		hook := cfg.OnDial
+		dial = func(ctx context.Context) (smtpClient, error) {
+			start := time.Now()
+			c, err := inner(ctx)
+			hook(time.Since(start), err)
+			return c, err
+		}
+	}
+	return &Mailer{
+		cfg:  cfg,
+		pool: newConnPool(cfg.MaxIdle, cfg.MaxOpen, cfg.NoopTimeout, dial),
+	}, nil
 }
 
 // Send delivers msg to all its envelope recipients (To + Cc + Bcc) in one
@@ -109,10 +139,6 @@ func (m *Mailer) SendBulk(ctx context.Context, msg *Message, recipients []string
 			continue
 		}
 
-		// select does not prioritise ctx.Done() over sem: when both are
-		// ready it may pick sem and create a worker even though the
-		// context is already cancelled. The worker's own ctx check below
-		// catches that case, so we still avoid touching the network.
 		select {
 		case <-ctx.Done():
 			errs[i] = ctx.Err()
@@ -124,11 +150,6 @@ func (m *Mailer) SendBulk(ctx context.Context, msg *Message, recipients []string
 		go func(i int, rcpt string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// Re-check inside the worker: the context may have been
-			// cancelled after the main-loop check but before this worker
-			// actually ran. Failing here means forRecipient and send are
-			// skipped entirely — the caller sees "send to <rcpt>" with
-			// context.Canceled, but no attempt was made.
 			if err := ctx.Err(); err != nil {
 				errs[i] = fmt.Errorf("send to %s: %w", rcpt, err)
 				return
@@ -152,12 +173,13 @@ func (m *Mailer) Close() {
 }
 
 func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
+	if m.cfg.OnSend != nil {
+		start := time.Now()
+		defer func() { m.cfg.OnSend(time.Since(start), err) }()
+	}
 	if m.closed.Load() {
 		return errors.New("mailer: closed")
 	}
-	// Defensive: Send and SendBulk already validate nil, but this method
-	// is the last line of defence. A future internal caller must not be
-	// able to panic the whole process by passing nil.
 	if msg == nil {
 		return errors.New("mailer: message is nil")
 	}
@@ -166,9 +188,6 @@ func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 		ctx, cancel = context.WithTimeout(ctx, m.cfg.Timeout)
 		defer cancel()
 	}
-	// Fail fast on an already-cancelled or already-expired context before
-	// taking or dialing a connection, so a warm pool cannot mask a
-	// cancellation coming from the caller.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -186,27 +205,13 @@ func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 	}()
 
 	err = m.runDialogue(c, msg)
-	// A cancelled context manifests as "use of closed network connection"
-	// or an i/o timeout from the socket tear-down. Surface the caller's
-	// actual error instead, so errors.Is(err, context.Canceled) and
-	// errors.Is(err, context.DeadlineExceeded) work as expected.
 	if err != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
 	return err
 }
 
-// runDialogue performs the SMTP transaction on c. Errors are returned
-// verbatim; send translates them to the caller's context error if the
-// context was cancelled during the dialogue.
-//
-// Once c.Data() succeeds, the SMTP session is in DATA mode: any error
-// from this point must abort the transaction without sending the
-// terminating ".\r\n", otherwise the server commits a partial message
-// while the caller sees an error. c.abort() closes the raw socket to
-// force the RFC 5321 §4.1.1.4 abort; smtp.Client.Close would send QUIT
-// into the data stream and then block waiting for a 221 the server will
-// not emit until it sees ".".
+// runDialogue performs the SMTP transaction on c.
 func (m *Mailer) runDialogue(c *poolConn, msg *Message) error {
 	if m.cfg.Auth != nil && !c.authed {
 		if ok, _ := c.Extension("AUTH"); ok {
@@ -242,15 +247,28 @@ func (m *Mailer) runDialogue(c *poolConn, msg *Message) error {
 	}
 	return w.Close()
 }
+
 func normalizeConfig(cfg *Config) error {
 	if cfg.Host == "" {
 		return errors.New("mailer: host is required")
+	}
+	switch cfg.TLSMode {
+	case TLSNone, TLSStart, TLSImplicit:
+		// valid
+	default:
+		return fmt.Errorf("mailer: unknown TLSMode %d", cfg.TLSMode)
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 587
 	}
 	if cfg.MaxIdle < 1 {
 		cfg.MaxIdle = 5
+	}
+	if cfg.MaxOpen < 0 {
+		return fmt.Errorf("mailer: MaxOpen must be non-negative, got %d", cfg.MaxOpen)
+	}
+	if cfg.MaxOpen > 0 && cfg.MaxIdle > cfg.MaxOpen {
+		cfg.MaxIdle = cfg.MaxOpen
 	}
 	if cfg.MaxConcurrency < 1 {
 		cfg.MaxConcurrency = 4
@@ -261,12 +279,6 @@ func normalizeConfig(cfg *Config) error {
 	if cfg.NoopTimeout == 0 {
 		cfg.NoopTimeout = defaultNoopTimeout
 	}
-	// Clone the caller's TLSConfig to prevent later mutation from
-	// affecting the Mailer, and ensure ServerName is populated: without
-	// it crypto/tls silently skips hostname verification, turning TLS
-	// into a MITM-friendly handshake. An explicitly set ServerName is
-	// preserved (the caller may be targeting a certificate issued for a
-	// different name, e.g. an internal alias).
 	if cfg.TLSConfig == nil {
 		cfg.TLSConfig = &tls.Config{ServerName: cfg.Host}
 	} else {
@@ -275,6 +287,5 @@ func normalizeConfig(cfg *Config) error {
 			cfg.TLSConfig.ServerName = cfg.Host
 		}
 	}
-
 	return nil
 }

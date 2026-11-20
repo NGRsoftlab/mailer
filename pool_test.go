@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/smtp"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -121,7 +122,7 @@ func (s *spyCtxClient) ReleaseContext() {
 func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 	var fc *fakeConn
 
-	p := newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		fc = &fakeConn{}
 		// Mimic what dialContext does: apply the caller's deadline on
 		// the freshly created connection.
@@ -164,7 +165,7 @@ func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 // TestPoolGetAfterClose ensures a closed pool never hands out new
 // connections. Guards the pre-loop check from regressing.
 func TestPoolGetAfterClose(t *testing.T) {
-	p := newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return &fakeClient{conn: &fakeConn{}}, nil
 	})
 	p.close()
@@ -186,7 +187,7 @@ func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 		fakeClient: &fakeClient{conn: fc},
 		onNoop:     func() { p.close() },
 	}
-	p = newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p = newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return c, nil
 	})
 
@@ -207,7 +208,7 @@ func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 // inside dial. get must not return the connection.
 func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
 	var p *connPool
-	p = newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p = newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		p.close()
 		return &fakeClient{conn: &fakeConn{}}, nil
 	})
@@ -220,9 +221,8 @@ func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
 
 // TestPoolNoopDeadlineCappedByNoopTimeout verifies that a Noop on an
 // idle connection is bounded by noopTimeout, not by the caller's full
-// send budget. Without the cap, a hung peer could consume the entire
-// Send budget on a liveness probe. Also verifies the socket deadline is
-// restored to the caller's deadline after the probe succeeds.
+// send budget. Also verifies the socket deadline is restored to the
+// caller's deadline after the probe succeeds.
 func TestPoolNoopDeadlineCappedByNoopTimeout(t *testing.T) {
 	fc := &fakeConn{}
 	noopTimeout := 100 * time.Millisecond
@@ -233,13 +233,11 @@ func TestPoolNoopDeadlineCappedByNoopTimeout(t *testing.T) {
 		fc:         fc,
 		onNoop:     func(d time.Time) { sawDeadline = d },
 	}
-	p := newConnPool(1, noopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, 0, noopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return c, nil
 	})
 	p.put(&poolConn{smtpClient: c})
 
-	// Caller's deadline is far in the future: 1 hour. If Noop used it,
-	// a hung peer would block for the whole hour.
 	d := time.Now().Add(time.Hour)
 	ctx, cancel := context.WithDeadline(context.Background(), d)
 	defer cancel()
@@ -262,8 +260,6 @@ func TestPoolNoopDeadlineCappedByNoopTimeout(t *testing.T) {
 	if sawDeadline.After(time.Now().Add(3 * noopTimeout)) {
 		t.Fatalf("Noop saw deadline %v, want roughly now+%v", sawDeadline, noopTimeout)
 	}
-	// After the probe succeeds, the socket deadline must be restored to
-	// the caller's deadline so the SMTP dialogue runs under its own budget.
 	if !fc.deadline.Equal(d) {
 		t.Fatalf("post-get deadline = %v, want %v", fc.deadline, d)
 	}
@@ -271,8 +267,7 @@ func TestPoolNoopDeadlineCappedByNoopTimeout(t *testing.T) {
 
 // TestPoolNoopBoundedWithoutCtxDeadline verifies that a Noop is bounded
 // by noopTimeout even when the caller supplied a context without any
-// deadline. Without the fix, the probe would block until the peer
-// eventually answered (or forever).
+// deadline.
 func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
 	fc := &fakeConn{}
 	noopTimeout := 100 * time.Millisecond
@@ -283,7 +278,7 @@ func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
 		fc:         fc,
 		onNoop:     func(d time.Time) { sawDeadline = d },
 	}
-	p := newConnPool(1, noopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, 0, noopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return c, nil
 	})
 	p.put(&poolConn{smtpClient: c})
@@ -300,7 +295,6 @@ func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
 	if sawDeadline.After(time.Now().Add(3 * noopTimeout)) {
 		t.Fatalf("Noop saw deadline %v, want roughly now+%v", sawDeadline, noopTimeout)
 	}
-	// With no caller deadline, the post-get deadline must be cleared.
 	if !fc.deadline.IsZero() {
 		t.Fatalf("post-get deadline = %v, want zero (no ctx deadline)", fc.deadline)
 	}
@@ -309,12 +303,10 @@ func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
 // TestPoolBindsAndReleasesContextOnReuse verifies the checkout lifecycle
 // contract introduced by the context-cancellation fix: an idle
 // connection gets bound to the caller's context on get, and released on
-// put. Without bind on get, a ctx cancelled during the SMTP dialogue
-// would not tear the socket down; without release on put, a cancelled
-// ctx would kill an idle pooled connection.
+// put.
 func TestPoolBindsAndReleasesContextOnReuse(t *testing.T) {
 	spy := &spyCtxClient{fakeClient: &fakeClient{conn: &fakeConn{}}}
-	p := newConnPool(1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+	p := newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return spy, nil
 	})
 	p.put(&poolConn{smtpClient: spy})
@@ -339,5 +331,149 @@ func TestPoolBindsAndReleasesContextOnReuse(t *testing.T) {
 	spy.mu.Unlock()
 	if releasesAfterPut < 1 {
 		t.Fatalf("releases after put = %d, want >= 1", releasesAfterPut)
+	}
+}
+
+// TestPoolMaxOpenBlocksExtraDials verifies that MaxOpen caps the number
+// of concurrently open connections. Without this limit, N parallel Send
+// calls would open N sockets regardless of MaxIdle.
+//
+// Each get is followed by c.Close(), which frees the slot for the next
+// waiter. So we expect exactly maxOpen concurrent dials at peak, and
+// maxOpen+1 total dials once all goroutines have completed.
+func TestPoolMaxOpenBlocksExtraDials(t *testing.T) {
+	const maxOpen = 2
+
+	var dials atomic.Int32
+	var inDial atomic.Int32
+	var peakInDial atomic.Int32
+
+	release := make(chan struct{})
+
+	p := newConnPool(maxOpen, maxOpen, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+		dials.Add(1)
+		cur := inDial.Add(1)
+		// Track peak concurrent dials with a lock-free CAS loop.
+		for {
+			peak := peakInDial.Load()
+			if cur <= peak || peakInDial.CompareAndSwap(peak, cur) {
+				break
+			}
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			inDial.Add(-1)
+			return nil, ctx.Err()
+		}
+		inDial.Add(-1)
+		return &fakeClient{conn: &fakeConn{}}, nil
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < maxOpen+1; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := p.get(context.Background())
+			if err != nil {
+				return
+			}
+			// Free the slot so the next waiter (if any) can dial.
+			_ = c.Close()
+		}()
+	}
+
+	// Wait until maxOpen dials have started.
+	deadline := time.Now().Add(2 * time.Second)
+	for dials.Load() < maxOpen && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := dials.Load(); got < maxOpen {
+		t.Fatalf("dials = %d, want at least %d", got, maxOpen)
+	}
+
+	// Give the (maxOpen+1)-th goroutine a chance to (wrongly) dial. It
+	// must remain blocked in acquireOpen because all slots are held.
+	time.Sleep(100 * time.Millisecond)
+	if got := dials.Load(); got > maxOpen {
+		t.Fatalf("dials = %d, want <= %d (MaxOpen must cap concurrent dials)", got, maxOpen)
+	}
+
+	// Release all blocked dials. The slot for the (maxOpen+1)-th
+	// goroutine is freed when the first two goroutines Close their
+	// connections after get returns.
+	close(release)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for all gets to complete")
+	}
+
+	if got := peakInDial.Load(); got > maxOpen {
+		t.Fatalf("peak concurrent dials = %d, want <= %d", got, maxOpen)
+	}
+	if got := dials.Load(); got != maxOpen+1 {
+		t.Fatalf("total dials = %d, want %d", got, maxOpen+1)
+	}
+}
+
+// TestPoolMaxOpenReusesIdle verifies that when an idle connection is
+// available, the pool hands it out instead of dialing a fresh one,
+// even under MaxOpen=1. Without the idle fast path in get, the second
+// call would need to acquire a slot that is still held by the idle
+// connection, and would block forever.
+func TestPoolMaxOpenReusesIdle(t *testing.T) {
+	var dials atomic.Int32
+	p := newConnPool(1, 1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+		dials.Add(1)
+		return &fakeClient{conn: &fakeConn{}}, nil
+	})
+
+	// First get: dials (slot 1/1, open=1).
+	c1, err := p.get(context.Background())
+	if err != nil {
+		t.Fatalf("get #1: %v", err)
+	}
+	// Return to idle — open stays 1, idle=[c1].
+	p.put(c1)
+
+	// Second get: reuses idle, no new dial.
+	c2, err := p.get(context.Background())
+	if err != nil {
+		t.Fatalf("get #2: %v", err)
+	}
+	p.put(c2)
+
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, want 1 (idle reuse should not dial)", got)
+	}
+}
+
+// TestNewCapsMaxIdleAtMaxOpen verifies that MaxIdle > MaxOpen is clamped
+// to MaxOpen. Otherwise idle connections would consume the entire open
+// budget and deadlock new Sends waiting for a slot that only gets freed
+// when an idle connection is actually torn down.
+func TestNewCapsMaxIdleAtMaxOpen(t *testing.T) {
+	m, err := newWithDial(Config{
+		Host:    "example.com",
+		MaxIdle: 10,
+		MaxOpen: 3,
+	}, func(ctx context.Context) (smtpClient, error) {
+		return &fakeClient{conn: &fakeConn{}}, nil
+	})
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	if m.cfg.MaxIdle != 3 {
+		t.Fatalf("MaxIdle = %d, want 3 (clamped to MaxOpen)", m.cfg.MaxIdle)
 	}
 }

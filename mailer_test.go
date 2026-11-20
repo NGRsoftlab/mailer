@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // spyWriteCloser is a DATA body writer that records whether Close was
@@ -284,5 +286,169 @@ func TestSendDataWriteErrorDoesNotCommit(t *testing.T) {
 	}
 	if spy.closeCalled.Load() {
 		t.Fatal("WriteCloser.Close was called on error; that would commit a partial message")
+	}
+}
+
+// TestNewRejectsUnknownTLSMode verifies that an unrecognised TLSMode is
+// rejected at construction time. Without this check, an out-of-range
+// value would silently fall through to the "opportunistic STARTTLS"
+// branch and could downgrade a session to plaintext.
+func TestNewRejectsUnknownTLSMode(t *testing.T) {
+	_, err := newWithDial(Config{Host: "example.com", TLSMode: TLSMode(99)}, noDialFunc(t))
+	if err == nil {
+		t.Fatal("expected error for unknown TLSMode")
+	}
+	if !strings.Contains(err.Error(), "unknown TLSMode") {
+		t.Errorf("error = %q, want it to mention unknown TLSMode", err)
+	}
+}
+
+// TestOnDialHook verifies that Config.OnDial is called for both
+// successful and failed dials, with the error propagated and a
+// non-negative duration.
+//
+// Both subtests go through newWithDial — the same internal constructor
+// every unit test uses — so this also pins the contract that OnDial is
+// wired inside newWithDial and not inside New. Wiring in New would let
+// every test constructor silently bypass the hook.
+func TestOnDialHook(t *testing.T) {
+	msg := &Message{
+		From:    "a@example.com",
+		To:      []string{"b@example.com"},
+		Subject: "x",
+		Text:    "y",
+	}
+
+	t.Run("success", func(t *testing.T) {
+		type call struct {
+			err error
+			d   time.Duration
+		}
+		var (
+			mu    sync.Mutex
+			calls []call
+		)
+		m, err := newWithDial(Config{
+			Host: "example.com",
+			OnDial: func(d time.Duration, err error) {
+				mu.Lock()
+				calls = append(calls, call{err: err, d: d})
+				mu.Unlock()
+			},
+		}, func(ctx context.Context) (smtpClient, error) {
+			return &fakeClient{conn: &fakeConn{}}, nil
+		})
+		if err != nil {
+			t.Fatalf("newWithDial: %v", err)
+		}
+		defer m.Close()
+
+		if err := m.Send(context.Background(), msg); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(calls) != 1 {
+			t.Fatalf("OnDial called %d times, want 1", len(calls))
+		}
+		if calls[0].err != nil {
+			t.Errorf("OnDial err = %v, want nil", calls[0].err)
+		}
+		if calls[0].d < 0 {
+			t.Errorf("OnDial duration = %v, want non-negative", calls[0].d)
+		}
+	})
+
+	t.Run("dial error", func(t *testing.T) {
+		dialErr := errors.New("simulated dial failure")
+		var (
+			mu      sync.Mutex
+			gotErrs []error
+		)
+		m, err := newWithDial(Config{
+			Host: "example.com",
+			OnDial: func(d time.Duration, err error) {
+				mu.Lock()
+				gotErrs = append(gotErrs, err)
+				mu.Unlock()
+			},
+		}, func(ctx context.Context) (smtpClient, error) {
+			return nil, dialErr
+		})
+		if err != nil {
+			t.Fatalf("newWithDial: %v", err)
+		}
+		defer m.Close()
+
+		err = m.Send(context.Background(), msg)
+		if !errors.Is(err, dialErr) {
+			t.Fatalf("Send err = %v, want %v", err, dialErr)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(gotErrs) != 1 {
+			t.Fatalf("OnDial called %d times, want 1", len(gotErrs))
+		}
+		if !errors.Is(gotErrs[0], dialErr) {
+			t.Errorf("OnDial err = %v, want %v", gotErrs[0], dialErr)
+		}
+	})
+}
+
+// TestOnSendHook verifies that Config.OnSend is called with the resulting
+// error and a non-negative duration, for both success and failure paths.
+func TestOnSendHook(t *testing.T) {
+	var mu sync.Mutex
+	var calls []struct {
+		err error
+		d   time.Duration
+	}
+
+	// Client that succeeds on Mail/Rcpt/Data/Write/Close.
+	successClient := &fakeClient{conn: &fakeConn{}}
+
+	m, err := newWithDial(Config{
+		Host: "example.com",
+		OnSend: func(d time.Duration, err error) {
+			mu.Lock()
+			calls = append(calls, struct {
+				err error
+				d   time.Duration
+			}{err, d})
+			mu.Unlock()
+		},
+	}, func(ctx context.Context) (smtpClient, error) {
+		return successClient, nil
+	})
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	// Success.
+	msg := &Message{From: "a@example.com", To: []string{"b@example.com"}, Subject: "x", Text: "y"}
+	if err := m.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// Failure: cancelled ctx after the hook is registered.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = m.Send(ctx, msg)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("OnSend called %d times, want 2", len(calls))
+	}
+	if calls[0].err != nil {
+		t.Errorf("success OnSend err = %v, want nil", calls[0].err)
+	}
+	if calls[1].err == nil {
+		t.Errorf("failure OnSend err = nil, want non-nil")
+	}
+	if calls[0].d < 0 || calls[1].d < 0 {
+		t.Errorf("durations must be non-negative, got %v / %v", calls[0].d, calls[1].d)
 	}
 }
