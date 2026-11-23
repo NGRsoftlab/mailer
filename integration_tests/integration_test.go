@@ -772,7 +772,7 @@ func TestOnSendHookWithRealServer(t *testing.T) {
 	host, portStr, _ := net.SplitHostPort(addr)
 	var (
 		calls    atomic.Int32
-		sawErr   atomic.Value // error
+		sawError atomic.Bool
 		sawDurMS atomic.Int64
 	)
 	m, err := mailer.New(mailer.Config{
@@ -780,7 +780,9 @@ func TestOnSendHookWithRealServer(t *testing.T) {
 		Port: mustAtoi(portStr),
 		OnSend: func(d time.Duration, e error) {
 			calls.Add(1)
-			sawErr.Store(e)
+			if e != nil {
+				sawError.Store(true)
+			}
 			sawDurMS.Store(int64(d / time.Millisecond))
 		},
 	})
@@ -802,10 +804,8 @@ func TestOnSendHookWithRealServer(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("OnSend called %d times, want 1", got)
 	}
-	if e := sawErr.Load(); e != nil {
-		if err, _ := e.(error); err != nil {
-			t.Errorf("OnSend err = %v, want nil", err)
-		}
+	if sawError.Load() {
+		t.Error("OnSend reported non-nil error on success path")
 	}
 	if got := sawDurMS.Load(); got < 0 {
 		t.Errorf("OnSend duration = %d ms, want non-negative", got)
