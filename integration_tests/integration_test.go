@@ -22,6 +22,7 @@ import (
 	"net/mail"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,10 @@ import (
 type testBackend struct {
 	mu       sync.Mutex
 	messages []*testMessage
+	// failRcpt lists recipients that the backend should reject with a 550
+	// at the RCPT stage. Used by partial-failure tests; nil map means
+	// "accept everyone".
+	failRcpt map[string]bool
 }
 
 type testMessage struct {
@@ -61,6 +66,16 @@ func (s *testSession) Mail(from string, opts *smtp.MailOptions) error {
 }
 
 func (s *testSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+	s.backend.mu.Lock()
+	reject := s.backend.failRcpt[to]
+	s.backend.mu.Unlock()
+	if reject {
+		return &smtp.SMTPError{
+			Code:         550,
+			EnhancedCode: smtp.EnhancedCode{5, 1, 1},
+			Message:      "recipient rejected",
+		}
+	}
 	s.to = append(s.to, to)
 	return nil
 }
@@ -132,8 +147,6 @@ func startTLSServer(t *testing.T, b *testBackend, implicit bool) (addr string, s
 	s.Addr = ln.Addr().String()
 
 	if implicit {
-		// Implicit TLS: wrap the listener so every accepted connection
-		// starts with a TLS handshake before any SMTP traffic.
 		tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
 		go func() {
 			if err := s.Serve(tlsLn); err != nil && !strings.Contains(err.Error(), "closed") {
@@ -141,8 +154,6 @@ func startTLSServer(t *testing.T, b *testBackend, implicit bool) (addr string, s
 			}
 		}()
 	} else {
-		// STARTTLS: plaintext listener, server advertises STARTTLS
-		// because TLSConfig is set.
 		s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 		go func() {
 			if err := s.Serve(ln); err != nil && !strings.Contains(err.Error(), "closed") {
@@ -201,8 +212,24 @@ func waitForMessage(t *testing.T, b *testBackend, timeout time.Duration) *testMe
 	return nil
 }
 
-// extractTextBody decodes the text/plain part of a raw MIME message,
-// handling both quoted-printable and base64 transfer encodings.
+func waitForMessageCount(t *testing.T, b *testBackend, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		b.mu.Lock()
+		got := len(b.messages)
+		b.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	b.mu.Lock()
+	got := len(b.messages)
+	b.mu.Unlock()
+	t.Fatalf("timed out waiting for %d messages, got %d", n, got)
+}
+
 func extractTextBody(t *testing.T, raw []byte) string {
 	t.Helper()
 
@@ -265,7 +292,7 @@ func assertBodyContains(t *testing.T, raw []byte, substr string) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests.
+// Existing tests.
 // ---------------------------------------------------------------------------
 
 func TestPlainSend(t *testing.T) {
@@ -331,16 +358,7 @@ func TestSendBulk(t *testing.T) {
 		t.Fatalf("SendBulk: %v", err)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		backend.mu.Lock()
-		n := len(backend.messages)
-		backend.mu.Unlock()
-		if n >= len(recipients) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForMessageCount(t, backend, len(recipients), 3*time.Second)
 
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
@@ -462,12 +480,6 @@ func TestContextCancellation(t *testing.T) {
 	}
 }
 
-// TestContextCancellationWithIdleConn covers the case where the pool
-// already holds a live, idle connection when Send is called with an
-// already-cancelled context. Without an explicit ctx check before
-// handing out the idle connection, such a call would silently succeed
-// and deliver the message. The fix must surface context.Canceled and
-// must not touch the server.
 func TestContextCancellationWithIdleConn(t *testing.T) {
 	backend := &testBackend{}
 	addr, stop := startPlainServer(t, backend)
@@ -483,8 +495,6 @@ func TestContextCancellationWithIdleConn(t *testing.T) {
 	}
 	defer m.Close()
 
-	// Warm up: send one message so the connection is returned to the
-	// idle pool and available for reuse.
 	warmup := &mailer.Message{
 		From:    "sender@example.com",
 		To:      []string{"rcpt@example.com"},
@@ -496,8 +506,6 @@ func TestContextCancellationWithIdleConn(t *testing.T) {
 	}
 	_ = waitForMessage(t, backend, 2*time.Second)
 
-	// Now the pool has a live idle connection. Send with a cancelled
-	// context: it must fail without delivering.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -514,8 +522,6 @@ func TestContextCancellationWithIdleConn(t *testing.T) {
 		t.Errorf("error = %v, want context.Canceled", err)
 	}
 
-	// Give any (unexpected) delivery a moment to land, then confirm
-	// exactly one message was delivered in total.
 	time.Sleep(100 * time.Millisecond)
 	backend.mu.Lock()
 	n := len(backend.messages)
@@ -525,23 +531,6 @@ func TestContextCancellationWithIdleConn(t *testing.T) {
 	}
 }
 
-func mustAtoi(s string) int {
-	n := 0
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			panic(fmt.Sprintf("not a number: %q", s))
-		}
-		n = n*10 + int(r-'0')
-	}
-	return n
-}
-
-// TestContextCancellationDuringDialogue verifies that cancelling the
-// context interrupts an in-flight SMTP exchange — not just the queueing
-// phase. The server below accepts TCP but never sends the 220 greeting,
-// so a client without context cancellation would block on Read until the
-// socket deadline expires (30s by default). With the fix, ctx cancel
-// tears the socket down promptly and Send returns context.Canceled.
 func TestContextCancellationDuringDialogue(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -549,8 +538,6 @@ func TestContextCancellationDuringDialogue(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Hold every accepted connection open and silent, so any SMTP
-	// operation blocks in Read.
 	stop := make(chan struct{})
 	go func() {
 		for {
@@ -568,10 +555,8 @@ func TestContextCancellationDuringDialogue(t *testing.T) {
 
 	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
 	m, err := mailer.New(mailer.Config{
-		Host: host,
-		Port: mustAtoi(portStr),
-		// Long timeout: if ctx cancel didn't abort, the test would hang
-		// for 30 seconds and fail visibly.
+		Host:    host,
+		Port:    mustAtoi(portStr),
 		Timeout: 30 * time.Second,
 	})
 	if err != nil {
@@ -604,5 +589,225 @@ func TestContextCancellationDuringDialogue(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("Send took %v, want prompt return on ctx cancel", elapsed)
+	}
+}
+
+func mustAtoi(s string) int {
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			panic(fmt.Sprintf("not a number: %q", s))
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// Group E: new coverage.
+// ---------------------------------------------------------------------------
+
+// TestSendBulkPartialFailure verifies that one rejected recipient does
+// not prevent delivery to the rest: SendBulk returns a joined error for
+// the bad address, the good addresses still receive their personalized
+// copy, and the backend observes exactly the expected messages.
+func TestSendBulkPartialFailure(t *testing.T) {
+	backend := &testBackend{
+		failRcpt: map[string]bool{
+			"bad@example.com": true,
+		},
+	}
+	addr, stop := startPlainServer(t, backend)
+	defer stop()
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	m, err := mailer.New(mailer.Config{
+		Host:           host,
+		Port:           mustAtoi(portStr),
+		MaxConcurrency: 4,
+	})
+	if err != nil {
+		t.Fatalf("mailer.New: %v", err)
+	}
+	defer m.Close()
+
+	msg := &mailer.Message{
+		From:    "sender@example.com",
+		Subject: "Bulk partial",
+		Text:    "Bulk body",
+	}
+	recipients := []string{"a@example.com", "bad@example.com", "c@example.com"}
+
+	err = m.SendBulk(context.Background(), msg, recipients)
+	if err == nil {
+		t.Fatal("expected error from partial bulk failure")
+	}
+	// Error must mention the rejected recipient.
+	if !strings.Contains(err.Error(), "bad@example.com") {
+		t.Errorf("error = %v, want it to mention bad@example.com", err)
+	}
+
+	// The two good recipients must have been delivered.
+	waitForMessageCount(t, backend, 2, 3*time.Second)
+	time.Sleep(100 * time.Millisecond) // allow any spurious third message
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.messages) != 2 {
+		t.Fatalf("delivered %d messages, want 2", len(backend.messages))
+	}
+	seen := make(map[string]bool)
+	for _, d := range backend.messages {
+		if len(d.To) != 1 {
+			t.Errorf("bulk message has %d recipients, want 1", len(d.To))
+		}
+		seen[d.To[0]] = true
+	}
+	if !seen["a@example.com"] || !seen["c@example.com"] {
+		t.Errorf("delivered set = %v, want {a@example.com, c@example.com}", seen)
+	}
+}
+
+// TestMaxOpenWithRealServer verifies that MaxOpen caps the number of
+// concurrent dials against a real server, and that the second Send
+// reuses the idle connection after the first one returns to the pool.
+func TestMaxOpenWithRealServer(t *testing.T) {
+	backend := &testBackend{}
+	addr, stop := startPlainServer(t, backend)
+	defer stop()
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	var dials atomic.Int32
+	m, err := mailer.New(mailer.Config{
+		Host:    host,
+		Port:    mustAtoi(portStr),
+		MaxOpen: 1,
+		MaxIdle: 1,
+		OnDial: func(_ time.Duration, _ error) {
+			dials.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("mailer.New: %v", err)
+	}
+	defer m.Close()
+
+	msg := &mailer.Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "parallel",
+		Text:    "parallel body",
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = m.Send(context.Background(), msg)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("Send #%d: %v", i, e)
+		}
+	}
+	if got := dials.Load(); got != 1 {
+		t.Errorf("dials = %d, want 1 (MaxOpen=1 must serialise dials and reuse idle)", got)
+	}
+	waitForMessageCount(t, backend, 2, 3*time.Second)
+}
+
+// TestIdleReuseWithRealServer verifies that two sequential Send calls
+// share one connection: the second finds the idle connection in the
+// pool and reuses it instead of dialing again.
+func TestIdleReuseWithRealServer(t *testing.T) {
+	backend := &testBackend{}
+	addr, stop := startPlainServer(t, backend)
+	defer stop()
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	var dials atomic.Int32
+	m, err := mailer.New(mailer.Config{
+		Host: host,
+		Port: mustAtoi(portStr),
+		OnDial: func(_ time.Duration, _ error) {
+			dials.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("mailer.New: %v", err)
+	}
+	defer m.Close()
+
+	msg := &mailer.Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "reuse",
+		Text:    "reuse body",
+	}
+	if err := m.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send #1: %v", err)
+	}
+	if err := m.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send #2: %v", err)
+	}
+
+	if got := dials.Load(); got != 1 {
+		t.Errorf("dials = %d, want 1 (second Send must reuse idle)", got)
+	}
+	waitForMessageCount(t, backend, 2, 3*time.Second)
+}
+
+// TestOnSendHookWithRealServer verifies that Config.OnSend is invoked
+// once per Send against a real server, with nil error on success.
+func TestOnSendHookWithRealServer(t *testing.T) {
+	backend := &testBackend{}
+	addr, stop := startPlainServer(t, backend)
+	defer stop()
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	var (
+		calls    atomic.Int32
+		sawErr   atomic.Value // error
+		sawDurMS atomic.Int64
+	)
+	m, err := mailer.New(mailer.Config{
+		Host: host,
+		Port: mustAtoi(portStr),
+		OnSend: func(d time.Duration, e error) {
+			calls.Add(1)
+			sawErr.Store(e)
+			sawDurMS.Store(int64(d / time.Millisecond))
+		},
+	})
+	if err != nil {
+		t.Fatalf("mailer.New: %v", err)
+	}
+	defer m.Close()
+
+	msg := &mailer.Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "hook",
+		Text:    "hook body",
+	}
+	if err := m.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("OnSend called %d times, want 1", got)
+	}
+	if e := sawErr.Load(); e != nil {
+		if err, _ := e.(error); err != nil {
+			t.Errorf("OnSend err = %v, want nil", err)
+		}
+	}
+	if got := sawDurMS.Load(); got < 0 {
+		t.Errorf("OnSend duration = %d ms, want non-negative", got)
 	}
 }

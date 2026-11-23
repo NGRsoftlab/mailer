@@ -59,6 +59,15 @@ func (f *fakeClient) Data() (io.WriteCloser, error)     { return nopWriteCloser{
 func (f *fakeClient) SetDeadline(t time.Time) error     { return f.conn.SetDeadline(t) }
 func (f *fakeClient) Close() error                      { return f.conn.Close() }
 
+// noopFailClient fails Noop — used to simulate a dead idle connection.
+type noopFailClient struct {
+	*fakeClient
+}
+
+func (c *noopFailClient) Noop() error {
+	return errors.New("simulated NOOP failure")
+}
+
 // callbackClient lets a test run arbitrary code at the beginning of Noop.
 type callbackClient struct {
 	*fakeClient
@@ -116,16 +125,12 @@ func (s *spyCtxClient) ReleaseContext() {
 
 // TestPoolRefreshesDeadlineOnReuse verifies that a pooled connection
 // receives a fresh deadline derived from the current context each time
-// it is checked out, rather than carrying over the deadline applied
-// during the previous send. Without the fix, the deadline from the
-// first ctx persists after the connection is put back and reused.
+// it is checked out.
 func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 	var fc *fakeConn
 
 	p := newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		fc = &fakeConn{}
-		// Mimic what dialContext does: apply the caller's deadline on
-		// the freshly created connection.
 		if deadline, ok := ctx.Deadline(); ok {
 			_ = fc.SetDeadline(deadline)
 		}
@@ -163,7 +168,7 @@ func TestPoolRefreshesDeadlineOnReuse(t *testing.T) {
 }
 
 // TestPoolGetAfterClose ensures a closed pool never hands out new
-// connections. Guards the pre-loop check from regressing.
+// connections.
 func TestPoolGetAfterClose(t *testing.T) {
 	p := newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		return &fakeClient{conn: &fakeConn{}}, nil
@@ -178,8 +183,7 @@ func TestPoolGetAfterClose(t *testing.T) {
 
 // TestPoolGetHonorsCloseDuringNoop exercises the window between
 // extracting an idle connection and returning it: Close is invoked
-// from inside Noop. get must not return the connection, and it must be
-// closed rather than leaked.
+// from inside Noop.
 func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 	fc := &fakeConn{}
 	var p *connPool
@@ -191,7 +195,6 @@ func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 		return c, nil
 	})
 
-	// Seed the pool with the callback client so get takes the idle path.
 	p.put(&poolConn{smtpClient: c})
 
 	_, err := p.get(context.Background())
@@ -204,8 +207,7 @@ func TestPoolGetHonorsCloseDuringNoop(t *testing.T) {
 }
 
 // TestPoolGetHonorsCloseDuringDial exercises the window between finishing
-// the dial and returning the fresh connection: Close is invoked from
-// inside dial. get must not return the connection.
+// the dial and returning the fresh connection.
 func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
 	var p *connPool
 	p = newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
@@ -221,8 +223,7 @@ func TestPoolGetHonorsCloseDuringDial(t *testing.T) {
 
 // TestPoolNoopDeadlineCappedByNoopTimeout verifies that a Noop on an
 // idle connection is bounded by noopTimeout, not by the caller's full
-// send budget. Also verifies the socket deadline is restored to the
-// caller's deadline after the probe succeeds.
+// send budget.
 func TestPoolNoopDeadlineCappedByNoopTimeout(t *testing.T) {
 	fc := &fakeConn{}
 	noopTimeout := 100 * time.Millisecond
@@ -301,9 +302,8 @@ func TestPoolNoopBoundedWithoutCtxDeadline(t *testing.T) {
 }
 
 // TestPoolBindsAndReleasesContextOnReuse verifies the checkout lifecycle
-// contract introduced by the context-cancellation fix: an idle
-// connection gets bound to the caller's context on get, and released on
-// put.
+// contract: an idle connection gets bound to the caller's context on
+// get and released on put.
 func TestPoolBindsAndReleasesContextOnReuse(t *testing.T) {
 	spy := &spyCtxClient{fakeClient: &fakeClient{conn: &fakeConn{}}}
 	p := newConnPool(1, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
@@ -334,13 +334,8 @@ func TestPoolBindsAndReleasesContextOnReuse(t *testing.T) {
 	}
 }
 
-// TestPoolMaxOpenBlocksExtraDials verifies that MaxOpen caps the number
-// of concurrently open connections. Without this limit, N parallel Send
-// calls would open N sockets regardless of MaxIdle.
-//
-// Each get is followed by c.Close(), which frees the slot for the next
-// waiter. So we expect exactly maxOpen concurrent dials at peak, and
-// maxOpen+1 total dials once all goroutines have completed.
+// TestPoolMaxOpenBlocksExtraDials verifies that MaxOpen caps concurrent
+// dials.
 func TestPoolMaxOpenBlocksExtraDials(t *testing.T) {
 	const maxOpen = 2
 
@@ -353,7 +348,6 @@ func TestPoolMaxOpenBlocksExtraDials(t *testing.T) {
 	p := newConnPool(maxOpen, maxOpen, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
 		dials.Add(1)
 		cur := inDial.Add(1)
-		// Track peak concurrent dials with a lock-free CAS loop.
 		for {
 			peak := peakInDial.Load()
 			if cur <= peak || peakInDial.CompareAndSwap(peak, cur) {
@@ -379,12 +373,10 @@ func TestPoolMaxOpenBlocksExtraDials(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// Free the slot so the next waiter (if any) can dial.
 			_ = c.Close()
 		}()
 	}
 
-	// Wait until maxOpen dials have started.
 	deadline := time.Now().Add(2 * time.Second)
 	for dials.Load() < maxOpen && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -393,16 +385,11 @@ func TestPoolMaxOpenBlocksExtraDials(t *testing.T) {
 		t.Fatalf("dials = %d, want at least %d", got, maxOpen)
 	}
 
-	// Give the (maxOpen+1)-th goroutine a chance to (wrongly) dial. It
-	// must remain blocked in acquireOpen because all slots are held.
 	time.Sleep(100 * time.Millisecond)
 	if got := dials.Load(); got > maxOpen {
 		t.Fatalf("dials = %d, want <= %d (MaxOpen must cap concurrent dials)", got, maxOpen)
 	}
 
-	// Release all blocked dials. The slot for the (maxOpen+1)-th
-	// goroutine is freed when the first two goroutines Close their
-	// connections after get returns.
 	close(release)
 
 	done := make(chan struct{})
@@ -425,10 +412,8 @@ func TestPoolMaxOpenBlocksExtraDials(t *testing.T) {
 }
 
 // TestPoolMaxOpenReusesIdle verifies that when an idle connection is
-// available, the pool hands it out instead of dialing a fresh one,
-// even under MaxOpen=1. Without the idle fast path in get, the second
-// call would need to acquire a slot that is still held by the idle
-// connection, and would block forever.
+// available, the pool hands it out instead of dialing a fresh one even
+// under MaxOpen=1.
 func TestPoolMaxOpenReusesIdle(t *testing.T) {
 	var dials atomic.Int32
 	p := newConnPool(1, 1, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
@@ -436,15 +421,12 @@ func TestPoolMaxOpenReusesIdle(t *testing.T) {
 		return &fakeClient{conn: &fakeConn{}}, nil
 	})
 
-	// First get: dials (slot 1/1, open=1).
 	c1, err := p.get(context.Background())
 	if err != nil {
 		t.Fatalf("get #1: %v", err)
 	}
-	// Return to idle — open stays 1, idle=[c1].
 	p.put(c1)
 
-	// Second get: reuses idle, no new dial.
 	c2, err := p.get(context.Background())
 	if err != nil {
 		t.Fatalf("get #2: %v", err)
@@ -457,9 +439,7 @@ func TestPoolMaxOpenReusesIdle(t *testing.T) {
 }
 
 // TestNewCapsMaxIdleAtMaxOpen verifies that MaxIdle > MaxOpen is clamped
-// to MaxOpen. Otherwise idle connections would consume the entire open
-// budget and deadlock new Sends waiting for a slot that only gets freed
-// when an idle connection is actually torn down.
+// to MaxOpen.
 func TestNewCapsMaxIdleAtMaxOpen(t *testing.T) {
 	m, err := newWithDial(Config{
 		Host:    "example.com",
@@ -476,4 +456,43 @@ func TestNewCapsMaxIdleAtMaxOpen(t *testing.T) {
 	if m.cfg.MaxIdle != 3 {
 		t.Fatalf("MaxIdle = %d, want 3 (clamped to MaxOpen)", m.cfg.MaxIdle)
 	}
+}
+
+// TestPoolProbeAttemptsBounded verifies that get() gives up probing
+// after maxProbeAttempts consecutive Noop failures and falls through to
+// a fresh dial, rather than probing every idle connection in a large
+// dead pool. Without this cap, a pool holding hundreds of stale idle
+// connections would burn the caller's entire Timeout before dialing.
+//
+// The 5 dead idle connections are seeded via put. get tries up to 3,
+// each failing Noop, then dials. The remaining 2 dead idles stay in the
+// pool (they will be probed by subsequent gets, also bounded by the
+// attempt cap).
+func TestPoolProbeAttemptsBounded(t *testing.T) {
+	var dials atomic.Int32
+
+	deadConn := func() smtpClient {
+		return &noopFailClient{fakeClient: &fakeClient{conn: &fakeConn{}}}
+	}
+
+	p := newConnPool(10, 0, defaultNoopTimeout, func(ctx context.Context) (smtpClient, error) {
+		dials.Add(1)
+		return &fakeClient{conn: &fakeConn{}}, nil
+	})
+
+	for i := 0; i < 5; i++ {
+		p.put(&poolConn{smtpClient: deadConn()})
+	}
+
+	c, err := p.get(context.Background())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, want 1 (after %d probe failures)", got, maxProbeAttempts)
+	}
+	if _, isDead := c.smtpClient.(*noopFailClient); isDead {
+		t.Fatal("get returned a dead connection instead of the fresh dial result")
+	}
+	p.put(c)
 }
