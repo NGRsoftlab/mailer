@@ -194,6 +194,16 @@ func (m *Mailer) send(ctx context.Context, msg *Message) (err error) {
 
 	c, err := m.pool.get(ctx)
 	if err != nil {
+		// pool.get can fail during dial (TCP connect, TLS handshake,
+		// SMTP greeting read) if the caller cancels the context while
+		// we're waiting for a live socket. The raw error in that case
+		// is a socket error ("use of closed network connection"), not
+		// context.Canceled — but the caller's documented contract is
+		// errors.Is(err, context.Canceled/DeadlineExceeded). Translate
+		// here, same as we do after runDialogue.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	}
 	defer func() {

@@ -452,3 +452,61 @@ func TestOnSendHook(t *testing.T) {
 		t.Errorf("durations must be non-negative, got %v / %v", calls[0].d, calls[1].d)
 	}
 }
+
+// TestSendTranslatesDialErrorOnCancel verifies that when Send is
+// cancelled while pool.get is in flight (dial / greeting read), the raw
+// socket error is translated to ctx.Err(). Without this, callers see
+// "use of closed network connection" instead of context.Canceled, and
+// errors.Is(err, context.Canceled) fails — breaking the documented
+// contract and, in particular, the TestContextCancellationDuringDialogue
+// integration test.
+func TestSendTranslatesDialErrorOnCancel(t *testing.T) {
+	socketErr := errors.New("simulated use of closed network connection")
+	dial := func(ctx context.Context) (smtpClient, error) {
+		// Simulate a dial that blocks until the caller cancels, then
+		// surfaces a socket-level error (which is what happens when
+		// the ctxWatcher closes the raw conn during greeting read).
+		<-ctx.Done()
+		return nil, socketErr
+	}
+
+	var (
+		mu        sync.Mutex
+		onSendErr error
+	)
+	m, err := newWithDial(Config{
+		Host: "example.com",
+		OnSend: func(_ time.Duration, err error) {
+			mu.Lock()
+			onSendErr = err
+			mu.Unlock()
+		},
+	}, dial)
+	if err != nil {
+		t.Fatalf("newWithDial: %v", err)
+	}
+	defer m.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	msg := &Message{
+		From:    "sender@example.com",
+		To:      []string{"rcpt@example.com"},
+		Subject: "x",
+		Text:    "y",
+	}
+	err = m.Send(ctx, msg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send err = %v, want context.Canceled (translated from %v)", err, socketErr)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !errors.Is(onSendErr, context.Canceled) {
+		t.Errorf("OnSend err = %v, want context.Canceled (hook must see translated error)", onSendErr)
+	}
+}
