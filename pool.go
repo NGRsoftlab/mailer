@@ -137,14 +137,31 @@ const (
 	acquireCtxDone
 )
 
+// connPool is a bounded SMTP connection pool.
+//
+// Concurrency model:
+//   - p.mu protects idle and closed. It is never held across a
+//     blocking operation (dial, Noop, Close).
+//   - p.slots is the MaxOpen semaphore. A token in the channel means
+//     "one open slot is taken" (whether idle or active). maxOpen == 0
+//     disables the semaphore (unbounded pool).
+//   - p.idleReady is a buffered signal that wake one waiter in
+//     acquireOpen when put() returns a connection to the idle list.
+//     The buffer is 1: a single token is enough because the woken
+//     waiter immediately inspects p.idle, and a missed wakeup (buffer
+//     already full) is harmless — the idle conn is still visible to
+//     the next get() via the fast path.
+//   - p.closedCh is closed exactly once in close(). Waiters select on
+//     it to unblock immediately when the pool shuts down.
 type connPool struct {
 	mu          sync.Mutex
 	idle        []*poolConn
 	dial        dialFunc
 	maxIdle     int
-	maxOpen     int        // 0 = unbounded
-	open        int        // idle + active
-	openCond    *sync.Cond // broadcast when open decreases or idle grows
+	maxOpen     int           // 0 = unbounded
+	slots       chan struct{} // nil when maxOpen == 0
+	idleReady   chan struct{} // buffered 1
+	closedCh    chan struct{} // closed on close()
 	noopTimeout time.Duration
 	closed      bool
 }
@@ -158,8 +175,12 @@ func newConnPool(maxIdle, maxOpen int, noopTimeout time.Duration, dial dialFunc)
 		maxOpen:     maxOpen,
 		noopTimeout: noopTimeout,
 		dial:        dial,
+		idleReady:   make(chan struct{}, 1),
+		closedCh:    make(chan struct{}),
 	}
-	p.openCond = sync.NewCond(&p.mu)
+	if maxOpen > 0 {
+		p.slots = make(chan struct{}, maxOpen)
+	}
 	return p
 }
 
@@ -167,58 +188,31 @@ func newConnPool(maxIdle, maxOpen int, noopTimeout time.Duration, dial dialFunc)
 // slot is available, an idle connection appears, ctx is cancelled, or
 // the pool is closed.
 //
-// Waiters are woken by:
-//   - openCond.Broadcast on release (Close / pool.close),
-//   - openCond.Broadcast on put-to-idle (an idle conn is just as good
-//     as a fresh slot for a waiting caller),
-//   - a per-call watchdog goroutine that broadcasts when ctx is done.
+// Unlike a sync.Cond-based implementation, this creates no goroutines:
+// both the ctx-cancelled and closed cases are native select branches.
 //
 // Called and returns with p.mu released.
 func (p *connPool) acquireOpen(ctx context.Context) acquireResult {
 	if p.maxOpen == 0 {
 		return acquireOK
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return acquireClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return acquireCtxDone
-	}
-	if p.open < p.maxOpen {
-		p.open++
+	// Fast path: try to grab a slot without blocking.
+	select {
+	case p.slots <- struct{}{}:
 		return acquireOK
+	default:
 	}
-	// Wait loop. A watchdog broadcasts on ctx cancellation so we don't
-	// miss the deadline while blocked on Cond.
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			p.mu.Lock()
-			p.openCond.Broadcast()
-			p.mu.Unlock()
-		case <-done:
-		}
-	}()
-	defer close(done)
 
-	for {
-		if p.closed {
-			return acquireClosed
-		}
-		if err := ctx.Err(); err != nil {
-			return acquireCtxDone
-		}
-		if len(p.idle) > 0 {
-			return acquireIdle
-		}
-		if p.open < p.maxOpen {
-			p.open++
-			return acquireOK
-		}
-		p.openCond.Wait()
+	// Slow path: wait for any of the four events.
+	select {
+	case p.slots <- struct{}{}:
+		return acquireOK
+	case <-p.idleReady:
+		return acquireIdle
+	case <-p.closedCh:
+		return acquireClosed
+	case <-ctx.Done():
+		return acquireCtxDone
 	}
 }
 
@@ -348,25 +342,20 @@ func (p *connPool) probeAndBind(ctx context.Context, c *poolConn) bool {
 	return true
 }
 
-// releaseOpen decrements the open counter and wakes a waiter. Safe to
-// call from any goroutine; invoked exactly once per connection via
+// releaseOpen returns the slot acquired by acquireOpen. Safe to call
+// from any goroutine; invoked exactly once per connection via
 // poolConn.closeOnce.
 func (p *connPool) releaseOpen() {
 	if p.maxOpen == 0 {
 		return
 	}
-	p.mu.Lock()
-	if p.open > 0 {
-		p.open--
-	}
-	p.openCond.Signal()
-	p.mu.Unlock()
+	<-p.slots
 }
 
 // put returns c to the idle pool, or closes it if the pool is closed or
 // full. Explicit Lock/Unlock in both branches: c.Close() calls
-// releaseOpen, which re-acquires p.mu — holding the lock across Close
-// would deadlock.
+// releaseOpen (which reads from p.slots) — holding p.mu across Close
+// is not required but keeping the critical section tight is.
 func (p *connPool) put(c *poolConn) {
 	if c == nil {
 		return
@@ -379,19 +368,30 @@ func (p *connPool) put(c *poolConn) {
 		return
 	}
 	p.idle = append(p.idle, c)
-	// Wake anyone blocked in acquireOpen: an idle connection is just as
-	// good as a freshly-acquired slot from their perspective.
-	p.openCond.Broadcast()
 	p.mu.Unlock()
+	// Wake one waiter blocked in acquireOpen: an idle connection is
+	// just as good as a freshly-acquired slot from their perspective.
+	// Non-blocking: if no one is waiting or the buffer is already full,
+	// the next get() will find the idle conn via the fast path.
+	select {
+	case p.idleReady <- struct{}{}:
+	default:
+	}
 }
 
 func (p *connPool) close() {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
 	p.closed = true
 	idle := p.idle
 	p.idle = nil
-	p.openCond.Broadcast()
 	p.mu.Unlock()
+
+	// Unblock everyone waiting in acquireOpen.
+	close(p.closedCh)
 
 	for _, c := range idle {
 		_ = c.Close()
