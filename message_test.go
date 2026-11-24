@@ -202,51 +202,6 @@ func TestMessageBytesAttachmentFilenameInjection(t *testing.T) {
 	}
 }
 
-// TestMessageBytesHeaderNameControlCharsDropped verifies that header
-// names containing control characters or line separators are dropped
-// entirely. The earlier implementation only rejected ":" and CR/LF,
-// letting VT, FF, NUL, DEL and U+2028/U+2029 slip through and produce
-// malformed RFC 5322 output (caught by FuzzMessageHeadersAndAttachment).
-func TestMessageBytesHeaderNameControlCharsDropped(t *testing.T) {
-	cases := []string{
-		"X-Ok\v",
-		"X-Ok\f",
-		"X-Ok\x00",
-		"X-Ok\x7f",
-		"X-Ok\u0085", // NEL
-		"X-Ok\u2028", // LINE SEPARATOR
-		"X-Ok\u2029", // PARAGRAPH SEPARATOR
-		"X-Ok:Injected",
-		"X-Ok\r",
-		"X-Ok\n",
-	}
-	for _, name := range cases {
-		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
-			msg := &Message{
-				From:    "sender@example.com",
-				To:      []string{"rcpt@example.com"},
-				Subject: "test",
-				Text:    "body",
-				Headers: map[string]string{name: "value"},
-			}
-			raw, err := msg.Bytes()
-			if err != nil {
-				t.Fatalf("Bytes: %v", err)
-			}
-			// The bad header must not appear at all.
-			for _, line := range strings.Split(string(raw), "\r\n") {
-				if strings.HasSuffix(line, "value") {
-					t.Fatalf("rejected header leaked into output: %q\n--- raw ---\n%s", line, raw)
-				}
-			}
-			// And the output must still parse.
-			if _, err := mail.ReadMessage(bytes.NewReader(raw)); err != nil {
-				t.Fatalf("parse: %v\n--- raw ---\n%s", err, raw)
-			}
-		})
-	}
-}
-
 // TestSanitizeMessageIDToken pins the filtering contract:
 // printable ASCII only, MIME specials stripped, at most one "@".
 func TestSanitizeMessageIDToken(t *testing.T) {
@@ -315,5 +270,107 @@ func TestBuildMessageIDRejectsMultipleAt(t *testing.T) {
 	}
 	if strings.Contains(mid, "a@b@c") {
 		t.Errorf("Message-Id = %q, contains caller's rejected multi-@ token", mid)
+	}
+}
+
+// TestMessageBytesHeaderNameRejected verifies that header names that do
+// not satisfy RFC 5322 field-name (1*ftext, where ftext = %d33-57 /
+// %d59-126) are dropped entirely. Covers two failure modes:
+//   - control chars / line separators: stripped by sanitizeHeaderValue,
+//     detected via clean != k;
+//   - SPACE / HTAB / ":" / non-ASCII: preserved by sanitizeHeaderValue
+//     (it is value-oriented) but forbidden in a field name, detected via
+//     isHeaderName.
+//
+// Caught by FuzzMessageHeadersAndAttachment for both classes.
+func TestMessageBytesHeaderNameRejected(t *testing.T) {
+	cases := []string{
+		// Control characters / line separators — sanitized away.
+		"X-Ok\v",
+		"X-Ok\f",
+		"X-Ok\x00",
+		"X-Ok\x7f",
+		"X-Ok\u0085", // NEL
+		"X-Ok\u2028", // LINE SEPARATOR
+		"X-Ok\u2029", // PARAGRAPH SEPARATOR
+		"X-Ok\r",
+		"X-Ok\n",
+		// SPACE and HTAB — forbidden by RFC 5322 but preserved by
+		// sanitizeHeaderValue (it is designed for values).
+		"0 ",
+		" X-Ok",
+		"X-Ok ",
+		"X -Ok",
+		"X\tOk",
+		"X-Ok\t",
+		// ":" — separates name from value; anything after it would be
+		// smuggled in as a value.
+		"X-Ok:Injected",
+		// Non-ASCII — rejected because field-name is ASCII-only.
+		"X-\u00a0Ok", // NBSP
+		"X-Кампания", // Cyrillic
+		"X-Ok\u2122", // TRADE MARK SIGN
+		// Empty and whitespace-only.
+		"",
+		" ",
+		"\t",
+	}
+	for _, name := range cases {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			msg := &Message{
+				From:    "sender@example.com",
+				To:      []string{"rcpt@example.com"},
+				Subject: "test",
+				Text:    "body",
+				Headers: map[string]string{name: "value"},
+			}
+			raw, err := msg.Bytes()
+			if err != nil {
+				t.Fatalf("Bytes: %v", err)
+			}
+			// The bad header must not appear at all.
+			for _, line := range strings.Split(string(raw), "\r\n") {
+				if strings.HasSuffix(line, "value") {
+					t.Fatalf("rejected header leaked into output: %q\n--- raw ---\n%s", line, raw)
+				}
+			}
+			// And the output must still parse.
+			if _, err := mail.ReadMessage(bytes.NewReader(raw)); err != nil {
+				t.Fatalf("parse: %v\n--- raw ---\n%s", err, raw)
+			}
+		})
+	}
+}
+
+// TestMessageBytesHeaderNameAccepted verifies that ordinary valid header
+// names still pass through unchanged.
+func TestMessageBytesHeaderNameAccepted(t *testing.T) {
+	cases := []string{
+		"X-Ok",
+		"Reply-To",
+		"X-Campaign-ID",
+		"X-Mailer",
+		"X.Received",
+		"X_Check",
+		"X123",
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			msg := &Message{
+				From:    "sender@example.com",
+				To:      []string{"rcpt@example.com"},
+				Subject: "test",
+				Text:    "body",
+				Headers: map[string]string{name: "value"},
+			}
+			raw, err := msg.Bytes()
+			if err != nil {
+				t.Fatalf("Bytes: %v", err)
+			}
+			parsed := parseMessage(t, raw)
+			if got := parsed.Header.Get(name); got != "value" {
+				t.Errorf("header %q = %q, want %q\n--- raw ---\n%s", name, got, "value", raw)
+			}
+		})
 	}
 }

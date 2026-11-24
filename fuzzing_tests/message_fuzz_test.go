@@ -160,7 +160,11 @@ func FuzzMessageHeadersAndAttachment(f *testing.F) {
 			"mime-version": true, "content-type": true,
 			"content-transfer-encoding": true,
 		}
-		hkLower := strings.ToLower(strings.TrimSpace(hk))
+		// A legitimate custom header is echoed back only if the caller's
+		// key was already a valid RFC 5322 field-name. Anything else is
+		// dropped, so the only non-standard header we may see is the
+		// exact key the fuzzer supplied (lowercased).
+		hkLower := strings.ToLower(hk)
 		for name := range parsed.Header {
 			lk := strings.ToLower(name)
 			if allowed[lk] {

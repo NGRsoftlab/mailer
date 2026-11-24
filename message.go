@@ -138,21 +138,27 @@ func writeCommonHeaders(buf *bytes.Buffer, m *Message) {
 	}
 
 	for k, v := range m.Headers {
-		// A header name must satisfy the same rules as a header value:
-		// no control characters, no CR/LF, no Unicode line/paragraph
-		// separators. The old "ContainsAny(k, \":\\r\\n\")" check only
-		// caught CR and LF, letting through VT, FF, NUL, DEL and
-		// U+2028/U+2029 — all of which some parsers treat as line breaks
-		// or which RFC 5322 forbids in a field name. We additionally
-		// reject any name that isn't printable ASCII with no separators,
-		// so attempted injection is dropped rather than silently
-		// sanitized into a "different but valid" header.
+		// A header name must satisfy RFC 5322 field-name:
+		//     1*ftext, where ftext = %d33-57 / %d59-126
+		// i.e. at least one printable ASCII character, no SPACE, no ":".
+		//
+		// sanitizeHeaderValue first strips control chars, CR, LF, NEL,
+		// U+2028, U+2029 — any of which would terminate or corrupt the
+		// header line. If it changed the input, the attempt was malicious
+		// or malformed: drop the header entirely rather than emit a
+		// "sanitized" header the caller never asked for.
+		//
+		// isHeaderName then enforces the rest of ftext: SPACE, HTAB and
+		// every non-ASCII byte are rejected here. sanitizeHeaderValue
+		// deliberately preserves SPACE and HTAB for header *values*, so
+		// this second check is where a value-only sanitizer would let
+		// "X-Foo " slip through.
 		clean := sanitizeHeaderValue(k)
-		if clean != k {
+		if clean != k || !isHeaderName(clean) {
 			continue
 		}
-		lk := strings.ToLower(strings.TrimSpace(clean))
-		if lk == "" || reserved[lk] || strings.ContainsAny(clean, ":") {
+		lk := strings.ToLower(clean)
+		if reserved[lk] {
 			continue
 		}
 		fmt.Fprintf(buf, "%s: %s\r\n", clean, sanitizeHeaderValue(v))
@@ -431,4 +437,22 @@ func sanitizeAddrList(addrs []string) string {
 		cleaned[i] = sanitizeHeaderValue(a)
 	}
 	return strings.Join(cleaned, ", ")
+}
+
+// isHeaderName reports whether s is a valid RFC 5322 field-name body:
+// one or more characters from %d33-%d126 excluding ':'. SPACE, HTAB,
+// control characters, and every byte outside printable ASCII (including
+// multibyte UTF-8) are rejected. Empty input is rejected because
+// field-name requires at least one character.
+func isHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x21 || b > 0x7e || b == ':' {
+			return false
+		}
+	}
+	return true
 }
