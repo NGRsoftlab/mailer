@@ -314,6 +314,7 @@ func TestMessageBytesHeaderNameRejected(t *testing.T) {
 		"",
 		" ",
 		"\t",
+		"\f0",
 	}
 	for _, name := range cases {
 		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
