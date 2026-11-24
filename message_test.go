@@ -3,6 +3,7 @@ package mailer
 
 import (
 	"bytes"
+	"fmt"
 	"net/mail"
 	"strings"
 	"testing"
@@ -198,5 +199,121 @@ func TestMessageBytesAttachmentFilenameInjection(t *testing.T) {
 	}
 	if bytes.Contains(raw, []byte("\r\nBcc:")) {
 		t.Fatalf("CRLF+Bcc injected into output\n--- raw ---\n%s", raw)
+	}
+}
+
+// TestMessageBytesHeaderNameControlCharsDropped verifies that header
+// names containing control characters or line separators are dropped
+// entirely. The earlier implementation only rejected ":" and CR/LF,
+// letting VT, FF, NUL, DEL and U+2028/U+2029 slip through and produce
+// malformed RFC 5322 output (caught by FuzzMessageHeadersAndAttachment).
+func TestMessageBytesHeaderNameControlCharsDropped(t *testing.T) {
+	cases := []string{
+		"X-Ok\v",
+		"X-Ok\f",
+		"X-Ok\x00",
+		"X-Ok\x7f",
+		"X-Ok\u0085", // NEL
+		"X-Ok\u2028", // LINE SEPARATOR
+		"X-Ok\u2029", // PARAGRAPH SEPARATOR
+		"X-Ok:Injected",
+		"X-Ok\r",
+		"X-Ok\n",
+	}
+	for _, name := range cases {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			msg := &Message{
+				From:    "sender@example.com",
+				To:      []string{"rcpt@example.com"},
+				Subject: "test",
+				Text:    "body",
+				Headers: map[string]string{name: "value"},
+			}
+			raw, err := msg.Bytes()
+			if err != nil {
+				t.Fatalf("Bytes: %v", err)
+			}
+			// The bad header must not appear at all.
+			for _, line := range strings.Split(string(raw), "\r\n") {
+				if strings.HasSuffix(line, "value") {
+					t.Fatalf("rejected header leaked into output: %q\n--- raw ---\n%s", line, raw)
+				}
+			}
+			// And the output must still parse.
+			if _, err := mail.ReadMessage(bytes.NewReader(raw)); err != nil {
+				t.Fatalf("parse: %v\n--- raw ---\n%s", err, raw)
+			}
+		})
+	}
+}
+
+// TestSanitizeMessageIDToken pins the filtering contract:
+// printable ASCII only, MIME specials stripped, at most one "@".
+func TestSanitizeMessageIDToken(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Ordinary: unchanged.
+		{"abc123", "abc123"},
+		{"abc@example.com", "abc@example.com"},
+		{"user.name@example.com", "user.name@example.com"},
+		// Control chars dropped.
+		{"a\vb", "ab"},
+		{"a\fb", "ab"},
+		{"a\x00b", "ab"},
+		{"a\x7fb", "ab"},
+		{"a\u0085b", "ab"}, // NEL
+		{"a\u2028b", "ab"}, // LINE SEPARATOR
+		{"a\u2029b", "ab"}, // PARAGRAPH SEPARATOR
+		{"a\r\nb", "ab"},
+		// MIME specials dropped.
+		{"a<b>c", "abc"},
+		{"a(b)c", "abc"},
+		{"a,b;c:d", "abcd"},
+		{"a\\b\"c", "abc"},
+		{"a b", "ab"},
+		// Bracket chars dropped (not atext).
+		{"a[1]b", "a1b"},
+		// One "@" allowed.
+		{"a@b", "a@b"},
+		{"@a", "@a"}, // caller (buildMessageID) will reject at==0
+		{"a@", "a@"}, // caller (buildMessageID) will reject at==len-1
+		// Two "@" rejected — whole token becomes invalid.
+		{"a@b@c", ""},
+		{"@@", ""},
+		{"@a@b", ""},
+		// Empty stays empty.
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeMessageIDToken(c.in); got != c.want {
+			t.Errorf("sanitizeMessageIDToken(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestBuildMessageIDRejectsMultipleAt verifies that a caller-supplied
+// MessageID containing multiple "@" does not produce a malformed
+// <a@b@c> wrapper; the fallback generator must kick in instead.
+func TestBuildMessageIDRejectsMultipleAt(t *testing.T) {
+	msg := &Message{
+		From:      "sender@example.com",
+		To:        []string{"rcpt@example.com"},
+		Subject:   "x",
+		Text:      "y",
+		MessageID: "a@b@c",
+	}
+	raw, err := msg.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	parsed := parseMessage(t, raw)
+	mid := parsed.Header.Get("Message-Id")
+	if strings.Count(mid, "@") != 1 {
+		t.Fatalf("Message-Id = %q, want exactly one @", mid)
+	}
+	if strings.Contains(mid, "a@b@c") {
+		t.Errorf("Message-Id = %q, contains caller's rejected multi-@ token", mid)
 	}
 }

@@ -138,11 +138,24 @@ func writeCommonHeaders(buf *bytes.Buffer, m *Message) {
 	}
 
 	for k, v := range m.Headers {
-		lk := strings.ToLower(strings.TrimSpace(k))
-		if lk == "" || reserved[lk] || strings.ContainsAny(k, ":\r\n") {
+		// A header name must satisfy the same rules as a header value:
+		// no control characters, no CR/LF, no Unicode line/paragraph
+		// separators. The old "ContainsAny(k, \":\\r\\n\")" check only
+		// caught CR and LF, letting through VT, FF, NUL, DEL and
+		// U+2028/U+2029 — all of which some parsers treat as line breaks
+		// or which RFC 5322 forbids in a field name. We additionally
+		// reject any name that isn't printable ASCII with no separators,
+		// so attempted injection is dropped rather than silently
+		// sanitized into a "different but valid" header.
+		clean := sanitizeHeaderValue(k)
+		if clean != k {
 			continue
 		}
-		fmt.Fprintf(buf, "%s: %s\r\n", k, sanitizeHeaderValue(v))
+		lk := strings.ToLower(strings.TrimSpace(clean))
+		if lk == "" || reserved[lk] || strings.ContainsAny(clean, ":") {
+			continue
+		}
+		fmt.Fprintf(buf, "%s: %s\r\n", clean, sanitizeHeaderValue(v))
 	}
 }
 
@@ -185,19 +198,40 @@ func messageIDDomain(from string) string {
 	return "mailer"
 }
 
-// sanitizeMessageIDToken strips everything outside printable ASCII,
-// removing characters that would terminate the header line or change its
-// structure. "@" is preserved so callers can supply a complete addr-spec.
+// sanitizeMessageIDToken filters a caller-supplied Message-ID or From
+// address down to characters that are valid in an RFC 5322 msg-id
+// (printable ASCII, minus MIME specials, plus at most one "@").
+//
+// Anything outside printable ASCII — control chars (CR, LF, VT, FF, NUL,
+// DEL), NEL, U+2028, U+2029 — is dropped: it either terminates the
+// header line or is illegal in a msg-id. "[", "]" are also dropped
+// because they are not atext and are not permitted in id-left/id-right;
+// some clients reject them outright. A second "@" makes the token an
+// invalid msg-id (two separators), so the whole token is rejected by
+// returning the empty string — buildMessageID treats empty as "generate".
+//
+// The output is not guaranteed to be a valid msg-id (a leading dot or a
+// lone "@" may still be present); the caller handles regeneration. What
+// is guaranteed: the output contains no header-breaking character and no
+// more than one "@".
 func sanitizeMessageIDToken(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
+	atSeen := false
 	for _, r := range s {
 		if r < 0x21 || r > 0x7e {
 			continue
 		}
 		switch r {
-		case '<', '>', '(', ')', ',', ';', ':', '\\', '"', ' ', '\t':
+		case '<', '>', '(', ')', ',', ';', ':', '\\', '"', ' ':
 			continue
+		case '[', ']':
+			continue
+		case '@':
+			if atSeen {
+				return ""
+			}
+			atSeen = true
 		}
 		b.WriteRune(r)
 	}

@@ -537,3 +537,14 @@ Two fuzz targets:
 - **Attachments are fully buffered in memory.** `Message.Bytes` renders the entire MIME document at once. This is fine for typical transactional emails but not for attachments measured in hundreds of megabytes. Streaming support would require a `WriteTo(io.Writer)` API.
 - **No retry, no rate limiting, no bounce handling.** These are deliberately out of scope; the library is a transport, not an email delivery platform.
 - **No built-in templating.** Rendered `Text` and `HTML` are expected; use whatever template engine fits your project.
+- **No background health checks.** Connection liveness is verified lazily via `NOOP` at the moment a connection is reused. This keeps the pool simple and avoids long-lived goroutines.
+- **`Close` must be called.** The mailer does not leak goroutines on its own, but it holds SMTP connections; `defer m.Close()` is the expected pattern. In-flight `Send`s are not synchronised by `Close` — joining caller goroutines is the caller's responsibility.
+- **Recipients are not validated.** Neither `Send` nor `SendBulk` parses addresses — the SMTP server is the authority. Invalid addresses surface as `Rcpt` errors and are reflected in the returned error.
+- **A single short-lived goroutine per in-flight `Send` bridges `ctx.Done()` to the TCP socket**; it is stopped when the connection is returned to the pool, so no long-lived goroutines are created for idle connections. Pool waiters themselves use channel-based synchronisation, not goroutines.
+- **Message-level validation is limited to rejecting `nil` and empty recipient lists**; the actual addresses are the SMTP server's responsibility.
+- **Date and Message-ID are computed at render time.** Each `Bytes()` call re-evaluates `Date` (if zero) and `Message-ID` (if empty), which is what makes `SendBulk` copies uniquely identifiable. If you pass explicit values, they are used as-is — you are then responsible for keeping them unique when sending multiple copies.
+- **`Config.TLSMode` is validated.** `New` rejects values outside `TLSNone`/`TLSStart`/`TLSImplicit`. This is intentional: Go's zero value for an untyped int falls through to the `TLSNone` branch, and an unknown mode silently downgrading a session to plaintext is the exact failure a fail-closed policy exists to prevent.
+
+## License
+
+MIT.
